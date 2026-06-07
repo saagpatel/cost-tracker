@@ -14,6 +14,12 @@ from cost_tracker import ccusage
 FIXTURES = Path(__file__).parent / "fixtures" / "ccusage_sample.json"
 
 
+class FixedDate(date):
+    @classmethod
+    def today(cls) -> FixedDate:
+        return cls(2026, 5, 18)
+
+
 @pytest.fixture()
 def sample() -> dict:
     return json.loads(FIXTURES.read_text())
@@ -31,10 +37,13 @@ def _mock_run(stdout: str):
 class TestCostToday:
     def test_happy_path_returns_today_entry(self, sample):
         payload = json.dumps(sample["daily_today"])
-        with patch("subprocess.run", return_value=_mock_run(payload)):
+        with (
+            patch("cost_tracker.ccusage.date", FixedDate),
+            patch("subprocess.run", return_value=_mock_run(payload)),
+        ):
             result = ccusage.cost_today()
 
-        assert result["date"] == date.today().isoformat()
+        assert result["date"] == FixedDate.today().isoformat()
         assert result["total_usd"] == 12.5
         assert result["by_model"]["opus"] == pytest.approx(9.5)
         assert result["by_model"]["sonnet"] == pytest.approx(2.75)
