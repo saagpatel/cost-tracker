@@ -80,6 +80,36 @@ class TestCostTopProjects:
         assert asc["record_count"] == 2
 
 
+class TestLatestCostRecord:
+    def test_returns_existing_record(self, tmp_db):
+        result = bridge_db.latest_cost_record(system="cc", month="2026-05", db_path=tmp_db)
+
+        assert result["exists"] is True
+        assert result["amount_usd"] == pytest.approx(120.0)
+        assert result["recorded_at"]
+
+    def test_missing_record_returns_exists_false(self, tmp_db):
+        result = bridge_db.latest_cost_record(system="cc", month="2026-06", db_path=tmp_db)
+
+        assert result == {"system": "cc", "month": "2026-06", "exists": False}
+
+    def test_missing_db_returns_error(self, tmp_path):
+        result = bridge_db.latest_cost_record(db_path=tmp_path / "nonexistent.db")
+
+        assert result["error"] == "bridge_db_unavailable"
+
+    def test_connect_failure_returns_bridge_db_error(self, tmp_db, monkeypatch):
+        def fail_connect(*args, **kwargs):
+            raise sqlite3.OperationalError("cannot open database")
+
+        monkeypatch.setattr(bridge_db, "_connect", fail_connect)
+
+        result = bridge_db.latest_cost_record(system="cc", month="2026-05", db_path=tmp_db)
+
+        assert result["error"] == "bridge_db_error"
+        assert result["detail"] == "cannot open database"
+
+
 class TestInsertCostRecord:
     def test_insert_valid_record(self, tmp_db):
         # Use personal_ops which is allowed by the DB CHECK constraint

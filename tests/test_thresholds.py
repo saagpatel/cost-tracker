@@ -60,7 +60,7 @@ class TestLoadThresholds:
     def test_defaults_when_no_config(self, tmp_path):
         result = load_thresholds(config_path=tmp_path / "nonexistent.toml")
 
-        assert result == [5.0, 15.0, 30.0]
+        assert result == [100.0, 250.0, 500.0]
 
     def test_loads_from_toml(self, tmp_path):
         cfg = tmp_path / "thresholds.toml"
@@ -76,7 +76,7 @@ class TestLoadThresholds:
 
         result = load_thresholds(config_path=cfg)
 
-        assert result == [5.0, 15.0, 30.0]
+        assert result == [100.0, 250.0, 500.0]
 
     def test_toml_values_are_sorted(self, tmp_path):
         cfg = tmp_path / "thresholds.toml"
