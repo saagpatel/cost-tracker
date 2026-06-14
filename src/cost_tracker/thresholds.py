@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 _CONFIG_PATH = Path.home() / ".config" / "cost-tracker" / "thresholds.toml"
-_DEFAULT_THRESHOLDS = [5.0, 15.0, 30.0]
+_DEFAULT_THRESHOLDS = [100.0, 250.0, 500.0]
 
 
 def load_thresholds(config_path: Path = _CONFIG_PATH) -> list[float]:

@@ -30,7 +30,11 @@ cost-tracker is an active local project in the /Users/d/Projects portfolio.
 
 ## Current State
 
-Portfolio truth currently marks this project as `recent` with `none` context. Phase 104 recovered minimum-viable context so future sessions can resume without rediscovery.
+Current portfolio truth should be checked in
+`/Users/d/Projects/GithubRepoAuditor/output/portfolio-truth-latest.json`; recent
+runs mark this project as `active-infra`. The repo still has minimum-viable
+recovered context, so verify live branch, README, and package commands before
+expanding scope.
 
 ## Stack
 
@@ -38,11 +42,13 @@ Portfolio truth currently marks this project as `recent` with `none` context. Ph
 
 ## How To Run
 
-- Review the README and top-level scripts before the next session; this repo does not yet expose one canonical run command inside the new context block.
+- Use `uv run cost-tracker` for the MCP server entrypoint. Run `uv run pytest`
+  and `uv run ruff check .` before claiming verification.
 
 ## Known Risks
 
-- This repo only has minimum-viable recovery context today; deeper handoff details may still live in the README and supporting docs.
+- This repo only has minimum-viable recovery context today; deeper handoff details
+  may still need to be captured in a dedicated handoff or roadmap.
 
 ## Next Recommended Move
 
