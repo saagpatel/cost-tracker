@@ -14,17 +14,10 @@ from typing import Any
 BRIDGE_DB_PATH = Path.home() / ".local" / "share" / "bridge-db" / "bridge.db"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
-_SESSION_COSTS_DDL = """
-CREATE TABLE IF NOT EXISTS session_costs (
-    session_id  TEXT PRIMARY KEY,
-    project_name TEXT,
-    started_at  TEXT NOT NULL,
-    cost_usd    REAL NOT NULL,
-    model_breakdown TEXT NOT NULL DEFAULT '{}',
-    source      TEXT NOT NULL DEFAULT 'cc',
-    recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-);
-"""
+# session_costs is owned and created by bridge-db, which holds the single,
+# version-gated schema definition (bridge_db/db.py, ensure_schema). cost-tracker is
+# a pure consumer: it upserts into the canonical table and never defines or creates
+# the schema, so the two can no longer diverge.
 
 
 def _decode_project_name(dirname: str) -> str | None:
@@ -157,7 +150,9 @@ def _run_ccusage() -> list[dict[str, Any]] | None:
 
 
 def _connect_rw(path: Path) -> sqlite3.Connection:
-    uri = f"file:{path}?mode=rwc"
+    # mode=rw, not rwc: bridge-db owns creation of the DB file and its schema.
+    # Callers guard db_path.exists() before connecting.
+    uri = f"file:{path}?mode=rw"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     return conn
@@ -200,15 +195,21 @@ def sync_session_costs(
     try:
         conn = _connect_rw(db_path)
 
-        # Ensure table exists
-        try:
-            conn.execute(_SESSION_COSTS_DDL)
-            conn.commit()
-        except sqlite3.OperationalError as exc:
+        # bridge-db owns the session_costs schema; cost-tracker does not create it.
+        # Fail cleanly if bridge-db has not initialized the table yet.
+        if (
+            conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='session_costs'"
+            ).fetchone()
+            is None
+        ):
             return {
                 "synced": 0,
                 "skipped": 0,
-                "errors": [f"session_costs table migration failed: {exc}"],
+                "errors": [
+                    "session_costs table not found in bridge.db — bridge-db owns and "
+                    "creates this table; ensure it has initialized its schema first"
+                ],
             }
 
         for session in sessions:
@@ -265,7 +266,7 @@ def sync_session_costs(
         return {
             "synced": synced,
             "skipped": skipped,
-            "errors": [f"session_costs table not yet populated — run sync first: {exc}"],
+            "errors": [f"bridge_db operational error: {exc}"],
         }
     except sqlite3.Error as exc:
         return {"synced": synced, "skipped": skipped, "errors": [f"bridge_db_error: {exc}"]}
