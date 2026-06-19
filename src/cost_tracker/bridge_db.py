@@ -29,48 +29,119 @@ def cost_top_projects(
     window_days: int = 14, db_path: Path = BRIDGE_DB_PATH
 ) -> list[dict[str, Any]]:
     """
-    Aggregate cost_records over the last `window_days` days.
+    Aggregate session_costs over the last window_days, grouped by project.
 
-    Groups by `notes`-derived project name (first non-empty word after "project:")
-    or by `system` if notes are empty/unparseable.
+    Falls back to cost_records system totals if session_costs table doesn't exist,
+    returning a note to run sync first.
 
-    Returns list of {project, total_usd, record_count} sorted by total_usd desc.
+    Returns list of {project, total_usd, session_count} sorted by total_usd desc.
     """
     if not db_path.exists():
         return [{"error": "bridge_db_unavailable", "detail": str(db_path)}]
 
-    cutoff = date.today() - timedelta(days=window_days)
-    cutoff_month = cutoff.strftime("%Y-%m")
+    cutoff = (date.today() - timedelta(days=window_days)).isoformat()
 
     conn: sqlite3.Connection | None = None
     try:
         conn = _connect(db_path, readonly=True)
         with conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT project_name, SUM(cost_usd) as total_usd, COUNT(*) as session_count
+                    FROM session_costs
+                    WHERE started_at >= ?
+                      AND project_name IS NOT NULL
+                    GROUP BY project_name
+                    ORDER BY total_usd DESC
+                    """,
+                    (cutoff,),
+                ).fetchall()
+
+                if not rows:
+                    # Table exists but no data — include unmapped sessions
+                    unmapped = conn.execute(
+                        """
+                        SELECT SUM(cost_usd) as total_usd, COUNT(*) as session_count
+                        FROM session_costs
+                        WHERE started_at >= ?
+                          AND project_name IS NULL
+                        """,
+                        (cutoff,),
+                    ).fetchone()
+                    result = []
+                    if unmapped and unmapped["total_usd"]:
+                        result.append(
+                            {
+                                "project": "(unmapped)",
+                                "total_usd": round(unmapped["total_usd"], 6),
+                                "session_count": unmapped["session_count"],
+                            }
+                        )
+                    return result
+
+                result = []
+                for row in rows:
+                    result.append(
+                        {
+                            "project": row["project_name"],
+                            "total_usd": round(row["total_usd"], 6),
+                            "session_count": row["session_count"],
+                        }
+                    )
+
+                # Also include unmapped sessions
+                unmapped = conn.execute(
+                    """
+                    SELECT SUM(cost_usd) as total_usd, COUNT(*) as session_count
+                    FROM session_costs
+                    WHERE started_at >= ?
+                      AND project_name IS NULL
+                    """,
+                    (cutoff,),
+                ).fetchone()
+                if unmapped and unmapped["total_usd"]:
+                    result.append(
+                        {
+                            "project": "(unmapped)",
+                            "total_usd": round(unmapped["total_usd"], 6),
+                            "session_count": unmapped["session_count"],
+                        }
+                    )
+
+                return sorted(result, key=lambda x: x["total_usd"], reverse=True)
+
+            except sqlite3.OperationalError:
+                # session_costs table doesn't exist — fall back to cost_records
+                pass
+
+            # Fallback: aggregate cost_records by system
+            cutoff_month = (date.today() - timedelta(days=window_days)).strftime("%Y-%m")
             rows = conn.execute(
                 """
-                SELECT system, notes, amount
+                SELECT system, SUM(amount) as total_usd, COUNT(*) as record_count
                 FROM cost_records
                 WHERE month >= ?
-                ORDER BY month DESC
+                GROUP BY system
+                ORDER BY total_usd DESC
                 """,
                 (cutoff_month,),
             ).fetchall()
+
+            return [
+                {
+                    "system": row["system"],
+                    "total_usd": round(row["total_usd"], 6),
+                    "note": "session_costs table not yet populated — run sync first",
+                }
+                for row in rows
+            ]
+
     except sqlite3.Error as exc:
         return [{"error": "bridge_db_error", "detail": str(exc)}]
     finally:
         if conn is not None:
             conn.close()
-
-    # Aggregate
-    totals: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        project = _derive_project(row["notes"], row["system"])
-        if project not in totals:
-            totals[project] = {"project": project, "total_usd": 0.0, "record_count": 0}
-        totals[project]["total_usd"] = round(totals[project]["total_usd"] + row["amount"], 6)
-        totals[project]["record_count"] += 1
-
-    return sorted(totals.values(), key=lambda x: x["total_usd"], reverse=True)
 
 
 def latest_cost_record(

@@ -202,3 +202,16 @@ def cost_record(
         system=system,
         notes=notes,
     )
+
+
+@app.tool()
+def cost_sync_sessions() -> dict[str, Any]:
+    """
+    Sync ccusage session data into bridge-db session_costs table.
+    Maps sessions to projects via ~/.claude/projects/ directory structure.
+    Run this to populate per-project cost attribution.
+    Returns {synced, skipped, errors}.
+    """
+    from cost_tracker.session_sync import sync_session_costs
+
+    return sync_session_costs()

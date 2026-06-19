@@ -44,26 +44,27 @@ def tmp_db(tmp_path: Path) -> Path:
 
 class TestCostTopProjects:
     def test_returns_sorted_by_spend(self, tmp_db):
+        # tmp_db has only cost_records — triggers fallback path (system-level totals)
         result = bridge_db.cost_top_projects(window_days=90, db_path=tmp_db)
 
         assert len(result) >= 1
         # Highest spender first
         assert result[0]["total_usd"] >= result[-1]["total_usd"]
 
-    def test_aggregates_multi_month(self, tmp_db):
+    def test_fallback_returns_system_key_not_project(self, tmp_db):
+        # Without session_costs table the fallback emits 'system' rows, not 'project' rows
         result = bridge_db.cost_top_projects(window_days=90, db_path=tmp_db)
 
-        # cc / asc-radar appears across April+May → should be aggregated under one label
-        labels = [r["project"] for r in result]
-        # "asc-radar" extracted from notes
-        assert any("asc-radar" in label for label in labels)
+        assert all("system" in r for r in result)
+        assert all("note" in r for r in result)
+        assert all("project" not in r for r in result)
 
-    def test_system_fallback_when_notes_empty(self, tmp_db):
+    def test_fallback_includes_cc_and_codex_systems(self, tmp_db):
         result = bridge_db.cost_top_projects(window_days=90, db_path=tmp_db)
 
-        labels = [r["project"] for r in result]
-        # codex row has no notes → should fall back to "codex"
-        assert "codex" in labels
+        systems = [r["system"] for r in result]
+        assert "cc" in systems
+        assert "codex" in systems
 
     def test_missing_db_returns_error(self, tmp_path):
         result = bridge_db.cost_top_projects(db_path=tmp_path / "nonexistent.db")
@@ -71,13 +72,13 @@ class TestCostTopProjects:
         assert len(result) == 1
         assert result[0]["error"] == "bridge_db_unavailable"
 
-    def test_record_count_is_accurate(self, tmp_db):
+    def test_fallback_aggregates_cc_across_months(self, tmp_db):
         result = bridge_db.cost_top_projects(window_days=90, db_path=tmp_db)
 
-        # cc system has 2 rows (April + May); both notes have "asc-radar"
-        asc = next((r for r in result if "asc-radar" in r.get("project", "")), None)
-        assert asc is not None
-        assert asc["record_count"] == 2
+        # cc has April (300) + May (120) = 420 total
+        cc_row = next((r for r in result if r.get("system") == "cc"), None)
+        assert cc_row is not None
+        assert cc_row["total_usd"] == pytest.approx(420.0)
 
 
 class TestLatestCostRecord:
@@ -131,9 +132,11 @@ class TestInsertCostRecord:
             notes="project:roundtrip-test",
             db_path=tmp_db,
         )
+        # Fallback path returns 'system' rows when session_costs table is absent
         result = bridge_db.cost_top_projects(window_days=9999, db_path=tmp_db)
-        labels = [r["project"] for r in result]
-        assert any("roundtrip-test" in label for label in labels)
+        # notion_os row should appear in fallback output
+        systems = [r.get("system") for r in result]
+        assert "notion_os" in systems
 
     def test_invalid_month_format_rejected(self, tmp_db):
         result = bridge_db.insert_cost_record(
