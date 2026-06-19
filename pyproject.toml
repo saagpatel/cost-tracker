@@ -18,12 +18,12 @@ cost-tracker = "cost_tracker.__main__:main"
 packages = ["src/cost_tracker"]
 
 [tool.ruff]
-line-length = 100
 target-version = "py312"
+extend = "../ruff.toml"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 ignore = ["E501"]
+extend-select = ["W", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
