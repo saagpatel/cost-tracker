@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -38,13 +39,10 @@ def cost_top_projects(
     if not db_path.exists():
         return [{"error": "bridge_db_unavailable", "detail": str(db_path)}]
 
-    # month-based window: find months within window_days
-    # cost_records stores month as "YYYY-MM"; we pull recent months and filter
-    from datetime import date, timedelta
-
     cutoff = date.today() - timedelta(days=window_days)
     cutoff_month = cutoff.strftime("%Y-%m")
 
+    conn: sqlite3.Connection | None = None
     try:
         conn = _connect(db_path, readonly=True)
         with conn:
@@ -60,7 +58,8 @@ def cost_top_projects(
     except sqlite3.Error as exc:
         return [{"error": "bridge_db_error", "detail": str(exc)}]
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
     # Aggregate
     totals: dict[str, dict[str, Any]] = {}
@@ -72,6 +71,52 @@ def cost_top_projects(
         totals[project]["record_count"] += 1
 
     return sorted(totals.values(), key=lambda x: x["total_usd"], reverse=True)
+
+
+def latest_cost_record(
+    system: str = "cc", month: str | None = None, db_path: Path = BRIDGE_DB_PATH
+) -> dict[str, Any]:
+    """
+    Return the persisted bridge-db cost row for a system/month.
+
+    Defaults to the current calendar month. This is read-only and intended for
+    stale-report detection against live ccusage output.
+    """
+    if month is None:
+        month = date.today().strftime("%Y-%m")
+
+    if not db_path.exists():
+        return {"error": "bridge_db_unavailable", "detail": str(db_path)}
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _connect(db_path, readonly=True)
+        with conn:
+            row = conn.execute(
+                """
+                SELECT system, month, amount, notes, recorded_at
+                FROM cost_records
+                WHERE system = ? AND month = ?
+                """,
+                (system, month),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        return {"error": "bridge_db_error", "detail": str(exc)}
+    finally:
+        if conn is not None:
+            conn.close()
+
+    if row is None:
+        return {"system": system, "month": month, "exists": False}
+
+    return {
+        "system": row["system"],
+        "month": row["month"],
+        "exists": True,
+        "amount_usd": round(row["amount"], 6),
+        "notes": row["notes"],
+        "recorded_at": row["recorded_at"],
+    }
 
 
 def _derive_project(notes: str | None, system: str) -> str:
@@ -117,6 +162,7 @@ def insert_cost_record(
     if not db_path.exists():
         return {"error": "bridge_db_unavailable", "detail": str(db_path)}
 
+    conn: sqlite3.Connection | None = None
     try:
         conn = _connect(db_path, readonly=False)
         with conn:
@@ -133,4 +179,5 @@ def insert_cost_record(
     except sqlite3.Error as exc:
         return {"error": "bridge_db_error", "detail": str(exc)}
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()

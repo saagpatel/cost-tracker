@@ -139,6 +139,117 @@ class TestCostMonthlyTrend:
         assert result[0]["error"] == "ccusage_unavailable"
 
 
+class TestCostMonthToDate:
+    def test_happy_path_returns_current_month(self, sample):
+        payload = json.dumps(sample["monthly"])
+        with (
+            patch("cost_tracker.ccusage.date", FixedDate),
+            patch("subprocess.run", return_value=_mock_run(payload)),
+        ):
+            result = ccusage.cost_month_to_date()
+
+        assert result["month"] == "2026-05"
+        assert result["total_usd"] == pytest.approx(75.0)
+        assert result["by_model"]["opus"] == pytest.approx(75.0)
+
+    def test_missing_current_month_returns_zero(self):
+        payload = json.dumps({"monthly": []})
+        with (
+            patch("cost_tracker.ccusage.date", FixedDate),
+            patch("subprocess.run", return_value=_mock_run(payload)),
+        ):
+            result = ccusage.cost_month_to_date()
+
+        assert result["month"] == "2026-05"
+        assert result["total_usd"] == 0.0
+        assert result["by_model"] == {}
+
+
+class TestCostTopDays:
+    def test_sorts_days_by_cost_desc(self, sample):
+        payload = json.dumps(
+            {
+                "daily": [
+                    sample["daily_today"]["daily"][0],
+                    {**sample["daily_today"]["daily"][0], "date": "2026-05-17", "totalCost": 2.0},
+                ]
+            }
+        )
+        with patch("subprocess.run", return_value=_mock_run(payload)):
+            result = ccusage.cost_top_days(days=2, limit=2)
+
+        assert [row["total_usd"] for row in result] == [12.5, 2.0]
+
+    def test_nonpositive_limit_returns_empty_list(self, sample):
+        payload = json.dumps(sample["daily_today"])
+        with patch("subprocess.run", return_value=_mock_run(payload)):
+            result = ccusage.cost_top_days(days=2, limit=0)
+
+        assert result == []
+
+
+class TestCostTopSessions:
+    def test_returns_sorted_sessions_with_caveat(self, sample):
+        payload = json.dumps(sample["session"])
+        with patch("subprocess.run", return_value=_mock_run(payload)):
+            result = ccusage.cost_top_sessions(window_days=14, limit=2)
+
+        assert result["attribution"] == "workflow_signal_not_invoice_window"
+        assert result["sessions"][0]["session_id"] == "-Users-d"
+        assert result["sessions"][1]["session_id"] == "-Users-d-Projects-cost-tracker"
+
+    def test_prefers_project_path_over_unknown_project(self, sample):
+        payload = json.dumps(
+            {
+                "sessions": [
+                    {
+                        **sample["session"]["sessions"][0],
+                        "project": "Unknown Project",
+                        "projectPath": "/Users/d/Projects/cost-tracker",
+                    }
+                ]
+            }
+        )
+        with patch("subprocess.run", return_value=_mock_run(payload)):
+            result = ccusage.cost_top_sessions(window_days=14, limit=1)
+
+        assert result["sessions"][0]["project"] == "/Users/d/Projects/cost-tracker"
+
+    def test_falls_back_to_session_id_when_project_is_unknown(self, sample):
+        payload = json.dumps(
+            {
+                "sessions": [
+                    {
+                        **sample["session"]["sessions"][0],
+                        "project": "Unknown Project",
+                        "projectPath": None,
+                    }
+                ]
+            }
+        )
+        with patch("subprocess.run", return_value=_mock_run(payload)):
+            result = ccusage.cost_top_sessions(window_days=14, limit=1)
+
+        assert result["sessions"][0]["project"] == "-Users-d"
+
+    def test_falls_back_to_session_id_when_project_path_is_unknown(self, sample):
+        payload = json.dumps(
+            {
+                "sessions": [
+                    {
+                        **sample["session"]["sessions"][0],
+                        "project": "Unknown Project",
+                        "projectPath": "Unknown Project",
+                    }
+                ]
+            }
+        )
+        with patch("subprocess.run", return_value=_mock_run(payload)):
+            result = ccusage.cost_top_sessions(window_days=14, limit=1)
+
+        assert result["sessions"][0]["project"] == "-Users-d"
+
+
 class TestModelFamily:
     @pytest.mark.parametrize(
         "model, expected",

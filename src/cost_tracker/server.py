@@ -1,4 +1,4 @@
-"""MCP server exposing 6 cost-tracking tools."""
+"""MCP server exposing local cost-tracking tools."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ app = FastMCP(
     name="cost-tracker",
     instructions=(
         "Provides live cost visibility for Claude Code sessions via ccusage CLI "
-        "and bridge-db cost_records. Six tools: cost_today, cost_session, "
-        "cost_monthly_trend, cost_top_projects, cost_alert_thresholds_check, cost_record."
+        "and bridge-db cost_records. Live ccusage values are actuals; Codex/OpenAI "
+        "local counters should be treated as directional unless provider billing is imported."
     ),
 )
 
@@ -57,6 +57,90 @@ def cost_monthly_trend(months: int = 3) -> list[dict[str, Any]]:
 
 
 @app.tool()
+def cost_month_to_date() -> dict[str, Any]:
+    """
+    Return current month-to-date Claude Code spend from live ccusage.
+
+    Shape: {month, total_usd, total_tokens, by_model, models_used}
+    """
+    return _ccusage.cost_month_to_date()
+
+
+@app.tool()
+def cost_top_days(days: int = 14, limit: int = 10) -> list[dict[str, Any]]:
+    """
+    Return recent daily Claude Code spend sorted by cost descending.
+
+    Args:
+        days: Number of recent days to inspect.
+        limit: Maximum rows to return.
+    """
+    return _ccusage.cost_top_days(days=days, limit=limit)
+
+
+@app.tool()
+def cost_top_sessions(window_days: int = 14, limit: int = 10) -> dict[str, Any]:
+    """
+    Return high-cost workflow/session groups from ccusage.
+
+    The result includes an attribution caveat because ccusage session grouping
+    is a workflow signal, not exact invoice-window spend.
+    """
+    return _ccusage.cost_top_sessions(window_days=window_days, limit=limit)
+
+
+@app.tool()
+def cost_bridge_staleness() -> dict[str, Any]:
+    """
+    Compare live current-month ccusage with the persisted bridge-db cost row.
+
+    This is a local visibility check. It does not mutate bridge-db and does not
+    define the scheduled cost-oracle refresh policy.
+
+    Shape:
+        {
+          month, live_total_usd, persisted_total_usd, delta_usd,
+          delta_exceeds_threshold, stale_reason, persisted_recorded_at, notes
+        }
+    """
+    live = _ccusage.cost_month_to_date()
+    if "error" in live:
+        return live
+
+    month = live["month"]
+    persisted = _bridge_db.latest_cost_record(system="cc", month=month)
+    if "error" in persisted:
+        return persisted
+
+    if not persisted.get("exists"):
+        return {
+            "month": month,
+            "live_total_usd": live["total_usd"],
+            "persisted_total_usd": None,
+            "delta_usd": None,
+            "delta_exceeds_threshold": None,
+            "stale": True,
+            "stale_reason": "missing_current_month_record",
+            "persisted_recorded_at": None,
+            "notes": "No bridge-db cost row exists for this month.",
+        }
+
+    delta = round(live["total_usd"] - persisted["amount_usd"], 6)
+    delta_exceeds_threshold = abs(delta) >= 1.0
+    return {
+        "month": month,
+        "live_total_usd": live["total_usd"],
+        "persisted_total_usd": persisted["amount_usd"],
+        "delta_usd": delta,
+        "delta_exceeds_threshold": delta_exceeds_threshold,
+        "stale": delta_exceeds_threshold,
+        "stale_reason": "delta_exceeds_1_usd" if delta_exceeds_threshold else None,
+        "persisted_recorded_at": persisted["recorded_at"],
+        "notes": persisted["notes"],
+    }
+
+
+@app.tool()
 def cost_top_projects(window_days: int = 14) -> list[dict[str, Any]]:
     """
     Return bridge-db cost_records aggregated by project, highest spend first.
@@ -75,9 +159,9 @@ def cost_alert_thresholds_check() -> dict[str, Any]:
     """
     Check today's spend against alert thresholds.
 
-    Thresholds default to [5, 15, 30] USD. Override via
+    Thresholds default to [100, 250, 500] USD. Override via
     ~/.config/cost-tracker/thresholds.toml with:
-        thresholds_usd = [5, 15, 30, 50]
+        thresholds_usd = [100, 250, 500, 1000]
 
     Returns:
         {today_usd, thresholds_crossed: [...], next_threshold, headroom_usd}
