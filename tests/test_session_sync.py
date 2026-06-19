@@ -27,16 +27,22 @@ CREATE TABLE cost_records (
 );
 """
 
+# Canonical session_costs schema, owned and created by bridge-db (db.py:114).
+# cost-tracker no longer defines this DDL; fixtures mirror bridge-db's schema so
+# the sync is tested against exactly what it relies on in production.
 SESSION_COSTS_DDL = """
 CREATE TABLE session_costs (
-    session_id  TEXT PRIMARY KEY,
-    project_name TEXT,
-    started_at  TEXT NOT NULL,
-    cost_usd    REAL NOT NULL,
-    model_breakdown TEXT NOT NULL DEFAULT '{}',
-    source      TEXT NOT NULL DEFAULT 'cc',
-    recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT    NOT NULL UNIQUE,
+    project_name    TEXT,
+    started_at      TEXT    NOT NULL,
+    cost_usd        REAL    NOT NULL,
+    model_breakdown TEXT,
+    source          TEXT    NOT NULL DEFAULT 'cc',
+    recorded_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
+CREATE INDEX idx_sc_project ON session_costs(project_name);
+CREATE INDEX idx_sc_started ON session_costs(started_at DESC);
 """
 
 
@@ -295,3 +301,42 @@ class TestSyncSessionCosts:
 
         assert result["synced"] == 1
         assert result["skipped"] == 1
+
+    def test_does_not_create_session_costs_when_missing(self, tmp_db_cost_records_only):
+        """bridge-db owns the session_costs schema; cost-tracker must not create it.
+
+        Given a bridge.db with only cost_records (no session_costs), sync returns a
+        clean error and leaves the schema untouched — it does NOT bootstrap the table.
+        """
+        sessions = [_make_session("sess-aaa", 2.50)]
+        result = sync_session_costs(
+            db_path=tmp_db_cost_records_only,
+            ccusage_fn=lambda: sessions,
+        )
+
+        assert result["synced"] == 0
+        assert any("session_costs" in e for e in result["errors"])
+
+        conn = sqlite3.connect(str(tmp_db_cost_records_only))
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='session_costs'"
+        ).fetchone()
+        conn.close()
+        assert exists is None, "cost-tracker must not create the session_costs table"
+
+    def test_syncs_against_bridge_db_canonical_schema(self, tmp_db_for_sync):
+        """The upsert relies on bridge-db's canonical schema (session_id UNIQUE, id PK)."""
+        sessions = [_make_session("sess-canon", 4.00)]
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: sessions)
+
+        assert result["synced"] == 1
+        conn = sqlite3.connect(str(tmp_db_for_sync))
+        row = conn.execute(
+            "SELECT id, cost_usd FROM session_costs WHERE session_id = 'sess-canon'"
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[1] == pytest.approx(4.00)
+        # The canonical schema assigns an integer autoincrement id on insert; the synced
+        # row carries one, proving it landed in bridge-db's canonical table.
+        assert isinstance(row[0], int)

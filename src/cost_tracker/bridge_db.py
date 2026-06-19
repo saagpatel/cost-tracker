@@ -213,9 +213,11 @@ def insert_cost_record(
     db_path: Path = BRIDGE_DB_PATH,
 ) -> dict[str, Any]:
     """
-    Insert a row into cost_records.
+    Upsert a row into cost_records on (system, month).
 
-    Returns {record_id, status: "inserted"} or {error, detail}.
+    Matches bridge-db's record_cost owner semantics (ON CONFLICT DO UPDATE).
+    Returns {record_id, status} where status is "inserted" or "updated",
+    or {error, detail} on failure.
     """
     # Validate inputs before touching the DB
     if not _MONTH_RE.match(month):
@@ -237,16 +239,30 @@ def insert_cost_record(
     try:
         conn = _connect(db_path, readonly=False)
         with conn:
+            existing = conn.execute(
+                "SELECT id FROM cost_records WHERE system = ? AND month = ?",
+                (system, month),
+            ).fetchone()
+            # Upsert to match bridge-db's record_cost owner semantics
+            # (ON CONFLICT(system, month) DO UPDATE) instead of raising on duplicates.
             cursor = conn.execute(
                 """
                 INSERT INTO cost_records (system, month, amount, notes)
                 VALUES (?, ?, ?, ?)
+                ON CONFLICT(system, month) DO UPDATE SET
+                    amount = excluded.amount,
+                    notes = excluded.notes,
+                    recorded_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
                 """,
                 (system, month, amount, notes),
             )
-            return {"record_id": cursor.lastrowid, "status": "inserted"}
-    except sqlite3.IntegrityError as exc:
-        return {"error": "integrity_error", "detail": str(exc)}
+            # record_id: on update the row keeps its id; on insert use the new rowid.
+            # status is advisory (the cost-recording path is single-writer in practice).
+            record_id = existing[0] if existing else cursor.lastrowid
+            return {
+                "record_id": record_id,
+                "status": "updated" if existing else "inserted",
+            }
     except sqlite3.Error as exc:
         return {"error": "bridge_db_error", "detail": str(exc)}
     finally:

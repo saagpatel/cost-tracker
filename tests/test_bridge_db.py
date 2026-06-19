@@ -176,12 +176,34 @@ class TestInsertCostRecord:
         )
         assert result["error"] == "bridge_db_unavailable"
 
-    def test_duplicate_system_month_returns_integrity_error(self, tmp_db):
-        # "cc" + "2026-05" already exists in tmp_db fixture
+    def test_duplicate_system_month_upserts(self, tmp_db):
+        # "cc" + "2026-05" already exists at 120.0 in tmp_db fixture.
+        # A duplicate now upserts to match bridge-db's record_cost owner semantics
+        # (ON CONFLICT(system, month) DO UPDATE), rather than raising IntegrityError.
+        conn = sqlite3.connect(str(tmp_db))
+        original_id = conn.execute(
+            "SELECT id FROM cost_records WHERE system='cc' AND month='2026-05'"
+        ).fetchone()[0]
+        conn.close()
+
         result = bridge_db.insert_cost_record(
             month="2026-05",
             amount=200.0,
             system="cc",
             db_path=tmp_db,
         )
-        assert result["error"] == "integrity_error"
+        assert result.get("error") is None
+        assert result["status"] == "updated"
+        # upsert must reuse the existing row, not create a phantom one
+        assert result["record_id"] == original_id
+
+        conn = sqlite3.connect(str(tmp_db))
+        amount = conn.execute(
+            "SELECT amount FROM cost_records WHERE system='cc' AND month='2026-05'"
+        ).fetchone()[0]
+        count = conn.execute(
+            "SELECT COUNT(*) FROM cost_records WHERE system='cc' AND month='2026-05'"
+        ).fetchone()[0]
+        conn.close()
+        assert amount == pytest.approx(200.0)
+        assert count == 1
