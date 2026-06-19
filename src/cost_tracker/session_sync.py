@@ -217,7 +217,13 @@ def sync_session_costs(
                 skipped += 1
                 continue
 
-            project_name = session_to_project.get(session_id)
+            # Two ccusage formats:
+            # - newer (npx ccusage@latest): period=UUID → look up via filesystem map
+            # - installed ccusage: sessionId=dir-name → decode directly
+            if session.get("period"):
+                project_name = session_to_project.get(session_id)
+            else:
+                project_name = _decode_project_name(session_id)
 
             metadata = session.get("metadata", {})
             started_at = metadata.get("lastActivity") or session.get("lastActivity", "")
