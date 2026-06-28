@@ -263,3 +263,34 @@ class TestModelFamily:
     )
     def test_family_mapping(self, model, expected):
         assert ccusage._model_family(model) == expected
+
+
+class TestIterModelCosts:
+    """ccusage modelBreakdowns parsing tolerates malformed payloads."""
+
+    def test_null_returns_empty(self):
+        assert ccusage._iter_model_costs(None) == []
+
+    def test_non_list_returns_empty(self):
+        assert ccusage._iter_model_costs({"modelName": "x"}) == []
+
+    def test_skips_non_dict_entries(self):
+        assert ccusage._iter_model_costs(["garbage", None, {"modelName": "m", "cost": 1.5}]) == [
+            ("m", 1.5)
+        ]
+
+    def test_non_numeric_cost_becomes_zero(self):
+        assert ccusage._iter_model_costs([{"modelName": "m", "cost": "oops"}]) == [("m", 0.0)]
+
+    def test_missing_name_becomes_empty_string(self):
+        assert ccusage._iter_model_costs([{"cost": 2.0}]) == [("", 2.0)]
+
+    def test_extract_by_model_handles_null_breakdowns(self):
+        assert ccusage._extract_by_model(None) == {}
+
+    def test_extract_by_model_skips_non_dict_entries(self):
+        result = ccusage._extract_by_model(
+            ["garbage", {"modelName": "claude-opus-4-8", "cost": 2.0}]
+        )
+        assert result["opus"] == pytest.approx(2.0)
+        assert len(result) == 1

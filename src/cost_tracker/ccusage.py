@@ -43,12 +43,35 @@ def _model_family(model_name: str) -> str:
     return "other"
 
 
-def _extract_by_model(breakdowns: list[dict[str, Any]]) -> dict[str, float]:
+def _iter_model_costs(breakdowns: object) -> list[tuple[str, float]]:
+    """Parse a ccusage ``modelBreakdowns`` value into (model_name, cost) pairs.
+
+    Tolerates a null/non-list value, non-dict entries, and non-numeric costs so a
+    malformed ccusage payload degrades to partial data instead of raising.
+    """
+    pairs: list[tuple[str, float]] = []
+    if not isinstance(breakdowns, list):
+        return pairs
+    for entry in breakdowns:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("modelName", "")
+        if not isinstance(name, str):
+            name = ""
+        try:
+            cost = float(entry.get("cost", 0.0))
+        except (TypeError, ValueError):
+            cost = 0.0
+        pairs.append((name, cost))
+    return pairs
+
+
+def _extract_by_model(breakdowns: object) -> dict[str, float]:
     """Aggregate model breakdowns into {family: total_cost}."""
     totals: dict[str, float] = {}
-    for b in breakdowns:
-        family = _model_family(b.get("modelName", ""))
-        totals[family] = round(totals.get(family, 0.0) + b.get("cost", 0.0), 6)
+    for name, cost in _iter_model_costs(breakdowns):
+        family = _model_family(name)
+        totals[family] = round(totals.get(family, 0.0) + cost, 6)
     return totals
 
 
