@@ -340,3 +340,36 @@ class TestSyncSessionCosts:
         # The canonical schema assigns an integer autoincrement id on insert; the synced
         # row carries one, proving it landed in bridge-db's canonical table.
         assert isinstance(row[0], int)
+
+
+class TestSyncMalformedBreakdowns:
+    """A malformed modelBreakdowns value must not crash the whole sync."""
+
+    def test_tolerates_null_model_breakdowns(self, tmp_db_for_sync):
+        session = {
+            "period": "sess-null",
+            "metadata": {},
+            "totalCost": 1.0,
+            "modelBreakdowns": None,
+        }
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: [session])
+        assert result["synced"] == 1
+        assert result["errors"] == []
+
+    def test_tolerates_non_dict_breakdown_entries(self, tmp_db_for_sync):
+        session = {
+            "period": "sess-bad",
+            "metadata": {},
+            "totalCost": 1.0,
+            "modelBreakdowns": ["garbage", {"modelName": "claude-sonnet-4-6", "cost": 1.0}],
+        }
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: [session])
+        assert result["synced"] == 1
+        conn = sqlite3.connect(str(tmp_db_for_sync))
+        row = conn.execute(
+            "SELECT model_breakdown FROM session_costs WHERE session_id = 'sess-bad'"
+        ).fetchone()
+        conn.close()
+        breakdown = json.loads(row[0])
+        assert breakdown["claude-sonnet-4-6"] == pytest.approx(1.0)
+        assert "garbage" not in breakdown

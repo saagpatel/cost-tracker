@@ -11,6 +11,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from cost_tracker.ccusage import _iter_model_costs
+
 BRIDGE_DB_PATH = Path.home() / ".local" / "share" / "bridge-db" / "bridge.db"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
@@ -232,9 +234,8 @@ def sync_session_costs(
             cost_usd = session.get("totalCost", 0.0)
 
             model_breakdown: dict[str, float] = {}
-            for mb in session.get("modelBreakdowns", []):
-                name = mb.get("modelName", "unknown")
-                model_breakdown[name] = round(mb.get("cost", 0.0), 6)
+            for name, cost in _iter_model_costs(session.get("modelBreakdowns")):
+                model_breakdown[name or "unknown"] = round(cost, 6)
 
             try:
                 conn.execute(
