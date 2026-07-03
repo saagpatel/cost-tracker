@@ -15,6 +15,7 @@ from cost_tracker.ccusage import _iter_model_costs
 
 BRIDGE_DB_PATH = Path.home() / ".local" / "share" / "bridge-db" / "bridge.db"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+HOME_ADHOC_PROJECT = "home-adhoc"
 
 # session_costs is owned and created by bridge-db, which holds the single,
 # version-gated schema definition (bridge_db/db.py, ensure_schema). cost-tracker is
@@ -40,7 +41,10 @@ def _decode_project_name(dirname: str) -> str | None:
       -Users-<user>-               → everything after is the top-level project name
       -private-                    → skip (tmp / system paths)
 
-    Returns None for empty results, single-char results, 'd', or 'tmp'.
+    Bare home-directory sessions return ``home-adhoc`` so genuinely non-project
+    work is attributed to a named hygiene bucket instead of becoming unmapped.
+
+    Returns None for empty results, single-char results, or 'tmp'.
     """
     if not dirname:
         return None
@@ -65,6 +69,8 @@ def _decode_project_name(dirname: str) -> str | None:
 
     # Drop the "Users-<username>-" prefix
     parts = s.split("-", 2)  # ["Users", "<user>", "rest..."]
+    if len(parts) == 2 and parts[0].lower() == "users" and parts[1]:
+        return HOME_ADHOC_PROJECT
     if len(parts) < 3 or parts[0].lower() != "users":
         # Not a home-path; fall back to simple last-segment approach
         segs = [p for p in dirname.replace("-", "/").split("/") if p]
@@ -92,7 +98,9 @@ def _decode_project_name(dirname: str) -> str | None:
     # No anchor matched — the remainder after the username IS the project name
     # e.g. -Users-d-Notion → remainder = '-Notion' → strip leading dash
     project = remainder.lstrip("-")
-    if not project or len(project) <= 1 or project.lower() in ("d", "tmp", "claude"):
+    if not project:
+        return HOME_ADHOC_PROJECT
+    if len(project) <= 1 or project.lower() in ("tmp", "claude"):
         return None
     return project
 
