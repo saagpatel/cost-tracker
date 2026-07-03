@@ -120,10 +120,22 @@ class TestDecodeProjectName:
         # Anchor-based decoding preserves the full project name including dashes
         assert _decode_project_name("-Users-d-Projects-bridge-db") == "bridge-db"
 
+    def test_workflow_hex_tail_maps_to_home_adhoc(self):
+        assert _decode_project_name("wf_7d0e9cc5-085") == "home-adhoc"
+
     def test_personal_ops_with_local_share(self):
         # '--' in dir name encodes '/.', e.g. ~/.local → '--local'
         # Anchor '--local-share-' captures the service name 'personal-ops' intact
         assert _decode_project_name("-Users-d--local-share-personal-ops") == "personal-ops"
+
+    def test_projects_anchor_recovers_dash_mangled_name(self):
+        assert _decode_project_name("-Users-d-Projects-Devil-s-Advocate") == "Devil's Advocate"
+
+    def test_projects_anchor_recovers_dash_mangled_moved_repo(self):
+        assert _decode_project_name("-Users-d-Projects-Fun-GamePrjs-BattleGrid") == "BattleGrid"
+
+    def test_unknown_no_anchor_home_fragment_maps_to_home_adhoc(self):
+        assert _decode_project_name("-Users-d-085") == "home-adhoc"
 
     def test_root_user_maps_to_home_adhoc(self):
         # Bare home dir has no project-name component, but it is still a named bucket.
