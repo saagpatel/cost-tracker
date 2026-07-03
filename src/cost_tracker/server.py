@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 
 from cost_tracker import bridge_db as _bridge_db
 from cost_tracker import ccusage as _ccusage
+from cost_tracker import classify as _classify
 from cost_tracker import thresholds as _thresholds
 
 app = FastMCP(
@@ -215,3 +216,15 @@ def cost_sync_sessions() -> dict[str, Any]:
     from cost_tracker.session_sync import sync_session_costs
 
     return sync_session_costs()
+
+
+@app.tool()
+def cost_routing_violations() -> dict[str, Any]:
+    """
+    Return weekly over-powered routing spend as a directional upper bound.
+
+    The query includes only derived classifications with confidence >= 0.6 and
+    names the spend field wasted_usd_upper_bound because full session cost is
+    attributed even when only part of the session may have been misrouted.
+    """
+    return _classify.cost_routing_violations()

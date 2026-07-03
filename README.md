@@ -37,6 +37,7 @@ Read-only visibility tools:
 - `cost_top_sessions` - high-cost workflow/session groups with attribution caveats
 - `cost_bridge_staleness` - live-vs-persisted bridge-db delta check
 - `cost_top_projects` - bridge-db cost records grouped by project
+- `cost_routing_violations` - weekly over-powered routing spend as a directional upper bound
 - `cost_alert_thresholds_check` - today's spend against local thresholds
 
 Write-capable manual tool:
