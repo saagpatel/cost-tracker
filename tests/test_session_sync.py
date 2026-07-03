@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 from cost_tracker import bridge_db
-from cost_tracker.session_sync import _decode_project_name, sync_session_costs
+from cost_tracker.session_sync import (
+    _build_session_project_map,
+    _decode_project_name,
+    sync_session_costs,
+)
 
 # ---------------------------------------------------------------------------
 # DDL helpers
@@ -121,9 +125,9 @@ class TestDecodeProjectName:
         # Anchor '--local-share-' captures the service name 'personal-ops' intact
         assert _decode_project_name("-Users-d--local-share-personal-ops") == "personal-ops"
 
-    def test_root_user_skipped(self):
-        # Bare home dir has no project-name component after username
-        assert _decode_project_name("-Users-d") is None
+    def test_root_user_maps_to_home_adhoc(self):
+        # Bare home dir has no project-name component, but it is still a named bucket.
+        assert _decode_project_name("-Users-d") == "home-adhoc"
 
     def test_private_tmp_skipped(self):
         # /private/tmp is a system path; skip on '-private-' prefix
@@ -138,6 +142,16 @@ class TestDecodeProjectName:
 
     def test_only_dashes_returns_none(self):
         assert _decode_project_name("---") is None
+
+    def test_home_project_dir_maps_uuid_sessions_to_home_adhoc(self, tmp_path):
+        projects_dir = tmp_path / "projects"
+        home_dir = projects_dir / "-Users-d"
+        home_dir.mkdir(parents=True)
+        (home_dir / "sess-home.jsonl").write_text("{}\n")
+
+        mapping = _build_session_project_map(projects_dir)
+
+        assert mapping["sess-home"] == "home-adhoc"
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +354,23 @@ class TestSyncSessionCosts:
         # The canonical schema assigns an integer autoincrement id on insert; the synced
         # row carries one, proving it landed in bridge-db's canonical table.
         assert isinstance(row[0], int)
+
+    def test_sync_maps_bare_home_session_id_to_named_bucket(self, tmp_db_for_sync):
+        session = {
+            "sessionId": "-Users-d",
+            "lastActivity": "2026-06-19T10:00:00.000Z",
+            "totalCost": 7.25,
+            "modelBreakdowns": [],
+        }
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: [session])
+
+        assert result["synced"] == 1
+        conn = sqlite3.connect(str(tmp_db_for_sync))
+        row = conn.execute(
+            "SELECT project_name FROM session_costs WHERE session_id = '-Users-d'"
+        ).fetchone()
+        conn.close()
+        assert row[0] == "home-adhoc"
 
 
 class TestSyncMalformedBreakdowns:
