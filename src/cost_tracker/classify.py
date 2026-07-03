@@ -508,7 +508,7 @@ def cost_routing_violations(
     *,
     min_confidence: float = MIN_QUERY_CONFIDENCE,
 ) -> dict[str, Any]:
-    """Return weekly over-powered spend as a directional upper bound."""
+    """Return bucket-ranked over-powered spend plus weekly directional context."""
     if not db_path.exists():
         return {"error": "bridge_db_unavailable", "detail": str(db_path)}
 
@@ -522,7 +522,23 @@ def cost_routing_violations(
                 "error": "missing_table",
                 "detail": "session_classification table not found; run bridge-db schema v12",
             }
-        rows = conn.execute(
+        bucket_rows = conn.execute(
+            """
+            SELECT COALESCE(sc.project_name, 'unmapped') AS project_name,
+                   COUNT(*) AS over_powered_rows,
+                   SUM(CASE WHEN sc.session_id GLOB '-*' THEN 1 ELSE 0 END) AS bucket_rows,
+                   SUM(CASE WHEN sc.session_id NOT GLOB '-*' THEN 1 ELSE 0 END) AS session_rows,
+                   ROUND(SUM(sc.cost_usd), 2) AS wasted_usd_upper_bound
+            FROM session_costs sc
+            JOIN session_classification cl USING (session_id)
+            WHERE cl.routing_basis = 'over-powered'
+              AND cl.confidence >= ?
+            GROUP BY COALESCE(sc.project_name, 'unmapped')
+            ORDER BY SUM(sc.cost_usd) DESC
+            """,
+            (min_confidence,),
+        ).fetchall()
+        weekly_rows = conn.execute(
             """
             SELECT strftime('%Y-W%W', sc.started_at) AS week,
                    COUNT(*) AS over_powered_sessions,
@@ -540,16 +556,30 @@ def cost_routing_violations(
             "confidence_threshold": min_confidence,
             "caveat": (
                 "wasted_usd_upper_bound attributes full session cost to over-powered "
-                "routing; it is directional, not provider billing truth"
+                "routing; rows are ccusage directory buckets, not individual sessions; "
+                "a bucket's lifetime cost is attributed to its started_at; treat weekly "
+                "figures as directional only, bucket ranking as the reliable view"
             ),
             "confidence_distribution": _confidence_distribution(conn),
+            "top_over_powered_buckets": [
+                {
+                    "rank": index,
+                    "project_name": row["project_name"],
+                    "granularity": "bucket" if row["bucket_rows"] else "session",
+                    "over_powered_rows": row["over_powered_rows"],
+                    "bucket_rows": row["bucket_rows"],
+                    "session_rows": row["session_rows"],
+                    "wasted_usd_upper_bound": row["wasted_usd_upper_bound"],
+                }
+                for index, row in enumerate(bucket_rows, start=1)
+            ],
             "weeks": [
                 {
                     "week": row["week"],
                     "over_powered_sessions": row["over_powered_sessions"],
                     "wasted_usd_upper_bound": row["wasted_usd_upper_bound"],
                 }
-                for row in rows
+                for row in weekly_rows
             ],
         }
     except sqlite3.Error as exc:

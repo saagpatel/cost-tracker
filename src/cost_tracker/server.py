@@ -221,10 +221,10 @@ def cost_sync_sessions() -> dict[str, Any]:
 @app.tool()
 def cost_routing_violations() -> dict[str, Any]:
     """
-    Return weekly over-powered routing spend as a directional upper bound.
+    Return bucket-ranked over-powered routing spend with weekly context.
 
     The query includes only derived classifications with confidence >= 0.6 and
     names the spend field wasted_usd_upper_bound because full session cost is
-    attributed even when only part of the session may have been misrouted.
+    attributed even when only part of the bucket/session may have been misrouted.
     """
     return _classify.cost_routing_violations()
