@@ -93,3 +93,13 @@ class TestCostBridgeStaleness:
         assert result["delta_exceeds_threshold"] is expected_exceeds
         assert result["stale"] is expected_exceeds
         assert result["stale_reason"] == expected_reason
+
+
+class TestCostRoutingViolations:
+    def test_delegates_to_classifier_read_tool(self, monkeypatch):
+        expected = {"weeks": [], "confidence_threshold": 0.6}
+        monkeypatch.setattr(server._classify, "cost_routing_violations", lambda: expected)
+
+        result = server.cost_routing_violations()
+
+        assert result == expected
