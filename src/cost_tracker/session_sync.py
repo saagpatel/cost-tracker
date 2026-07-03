@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +45,8 @@ def _decode_project_name(dirname: str) -> str | None:
     Bare home-directory sessions return ``home-adhoc`` so genuinely non-project
     work is attributed to a named hygiene bucket instead of becoming unmapped.
 
-    Returns None for empty results, single-char results, or 'tmp'.
+    Returns ``home-adhoc`` for ambiguous non-project fragments and None for
+    empty/system results.
     """
     if not dirname:
         return None
@@ -54,11 +56,11 @@ def _decode_project_name(dirname: str) -> str | None:
         return None
 
     # Known anchor patterns (order matters — most-specific first)
-    _ANCHOR_PATTERNS = [
-        "--local-share-",  # ~/.local/share/<service>
-        "--claude-",  # ~/.claude/<sub>
-        "-Projects-",  # ~/Projects/<project>
-        "-Documents-",  # ~/Documents/<project>
+    anchor_patterns = [
+        ("--local-share-", Path.home() / ".local" / "share"),
+        ("--claude-", Path.home() / ".claude"),
+        ("-Projects-", Path.home() / "Projects"),
+        ("-Documents-", Path.home() / "Documents"),
     ]
 
     # Strip leading '-Users-<user>' prefix first
@@ -72,17 +74,18 @@ def _decode_project_name(dirname: str) -> str | None:
     if len(parts) == 2 and parts[0].lower() == "users" and parts[1]:
         return HOME_ADHOC_PROJECT
     if len(parts) < 3 or parts[0].lower() != "users":
-        # Not a home-path; fall back to simple last-segment approach
+        # Not a home path. ccusage workflow/session IDs such as
+        # ``wf_7d0e9cc5-085`` are not project names; their tails previously leaked
+        # as 3-char hex project keys. Bucket them instead of returning fragments.
         segs = [p for p in dirname.replace("-", "/").split("/") if p]
         if not segs:
             return None
-        candidate = segs[-1]
-        return candidate if len(candidate) > 1 and candidate.lower() not in ("d", "tmp") else None
+        return None if _is_system_fragment(segs[-1]) else HOME_ADHOC_PROJECT
 
     remainder = "-" + parts[2]  # restore leading dash for anchor matching
 
     # Try anchors
-    for anchor in _ANCHOR_PATTERNS:
+    for anchor, root in anchor_patterns:
         idx = remainder.find(anchor)
         if idx != -1:
             project = remainder[idx + len(anchor) :]
@@ -93,16 +96,95 @@ def _decode_project_name(dirname: str) -> str | None:
                 return None
             if len(project) <= 1 or project.lower() == "d":
                 return None
-            return project
+            return _recover_project_path(root, project) or project
 
-    # No anchor matched — the remainder after the username IS the project name
-    # e.g. -Users-d-Notion → remainder = '-Notion' → strip leading dash
+    # No anchor matched. Treat the remainder as an ambiguous decode failure, not
+    # a project name, because returning it can leak short hex tails and lossy
+    # dash-mangled path fragments into session_costs.project_name.
     project = remainder.lstrip("-")
     if not project:
         return HOME_ADHOC_PROJECT
-    if len(project) <= 1 or project.lower() in ("tmp", "claude"):
+    if _is_system_fragment(project) or project.lower() == "claude":
         return None
-    return project
+    return HOME_ADHOC_PROJECT
+
+
+def _is_system_fragment(candidate: str) -> bool:
+    """Return True for values that should be skipped instead of bucketed."""
+    return len(candidate) <= 1 or candidate.lower() in {"d", "tmp"}
+
+
+def _safe_encoded_path(value: str) -> str:
+    """
+    Approximate Claude's lossy project-dir encoding for local path recovery.
+
+    Separators, apostrophes, spaces, and punctuation flatten to dashes while
+    existing dashes remain stable, which lets us match names like
+    ``Devil's Advocate`` against ``Devil-s-Advocate``.
+    """
+    encoded: list[str] = []
+    for char in value:
+        if char.isalnum() or char in {"-", "_", "."}:
+            encoded.append(char)
+        else:
+            encoded.append("-")
+    return "".join(encoded)
+
+
+@lru_cache(maxsize=8)
+def _encoded_project_paths(root: str) -> dict[str, str]:
+    root_path = Path(root)
+    if not root_path.is_dir():
+        return {}
+
+    skip_names = {
+        ".git",
+        ".hg",
+        ".next",
+        ".ruff_cache",
+        ".venv",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+        "venv",
+    }
+    encoded: dict[str, str] = {}
+    stack: list[tuple[Path, int]] = [(root_path, 0)]
+    max_depth = 3
+
+    while stack:
+        current, depth = stack.pop()
+        if depth >= max_depth:
+            continue
+        try:
+            children = [child for child in current.iterdir() if child.is_dir()]
+        except OSError:
+            continue
+
+        for child in children:
+            if child.name in skip_names:
+                continue
+            relative = child.relative_to(root_path).as_posix()
+            encoded.setdefault(_safe_encoded_path(relative), relative)
+            stack.append((child, depth + 1))
+
+    return encoded
+
+
+def _recover_project_path(root: Path, encoded_project: str) -> str | None:
+    known_paths = _encoded_project_paths(str(root))
+    if recovered := known_paths.get(encoded_project):
+        return recovered
+
+    parts = encoded_project.split("-")
+    for idx in range(1, len(parts)):
+        prefix = "-".join(parts[:idx])
+        suffix = "-".join(parts[idx:])
+        if prefix in known_paths and (recovered := known_paths.get(suffix)):
+            return recovered
+
+    return None
 
 
 def _build_session_project_map(projects_dir: Path = CLAUDE_PROJECTS_DIR) -> dict[str, str]:
