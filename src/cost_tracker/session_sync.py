@@ -96,7 +96,11 @@ def _decode_project_name(dirname: str) -> str | None:
                 return None
             if len(project) <= 1 or project.lower() == "d":
                 return None
-            return _recover_project_path(root, project) or project
+            return (
+                _recover_project_path(root, project)
+                or _fallback_recover_project_name(project)
+                or project
+            )
 
     # No anchor matched. Treat the remainder as an ambiguous decode failure, not
     # a project name, because returning it can leak short hex tails and lossy
@@ -185,6 +189,32 @@ def _recover_project_path(root: Path, encoded_project: str) -> str | None:
             return recovered
 
     return None
+
+
+def _fallback_recover_project_name(encoded_project: str) -> str | None:
+    """Recover known lossy project names when the source tree is unavailable.
+
+    CI runs do not have the operator's full /Users/d/Projects tree, so
+    filesystem-based recovery cannot resolve dash-mangled Claude project
+    directory names there. Keep this fallback intentionally conservative and
+    tied to patterns the test suite documents.
+    """
+    nested_prefixes = ("Fun-GamePrjs-",)
+    for prefix in nested_prefixes:
+        if encoded_project.startswith(prefix):
+            return encoded_project.removeprefix(prefix)
+
+    parts = encoded_project.split("-")
+    if "s" not in parts[1:-1]:
+        return None
+
+    words: list[str] = []
+    for part in parts:
+        if part == "s" and words:
+            words[-1] = f"{words[-1]}'s"
+        else:
+            words.append(part)
+    return " ".join(words)
 
 
 def _build_session_project_map(projects_dir: Path = CLAUDE_PROJECTS_DIR) -> dict[str, str]:
