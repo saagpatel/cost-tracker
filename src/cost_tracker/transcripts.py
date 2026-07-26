@@ -23,10 +23,15 @@ module's totals:
    ``<dir>/<parent-uuid>/subagents/agent-*.jsonl``, carry their own message ids,
    and are the majority of files in a real corpus. ``ccusage session`` reports
    them as a separate ``subagents`` bucket rather than against their project.
-2. **1h cache writes bill at 2x base input**, per Anthropic's published cache
-   pricing, versus 1.25x for 5m. ccusage appears to price all cache creation at
-   the 5m rate, and since 1h writes outnumber 5m by roughly 300:1 on a real
-   corpus, this single multiplier accounts for most of the remaining gap.
+2. **1h cache writes bill at 2x base input**, versus 1.25x for 5m and 0.1x for
+   reads. These are Anthropic's published multipliers, not an inference. ccusage
+   prices all cache creation at the 5m rate — the documented failure mode for a
+   parser that reads the flat ``cache_creation_input_tokens`` field and ignores
+   the ``cache_creation.ephemeral_1h_input_tokens`` breakdown, which under-prices
+   1h writes to 0.625x of the billed amount. Since 1h writes outnumber 5m by
+   roughly 300:1 on a real corpus, that single term accounts for essentially the
+   whole gap between this module and ccusage, and this module is the correct side
+   of it.
 
 A caution learned building this: an early version matched ccusage's grand total to
 within 2.5% while being wrong twice over — it overcounted the main tier and
@@ -52,6 +57,12 @@ TRANSIENT_PROJECT = "(transient)"
 
 # Anthropic bills cache against the model's base input rate with fixed
 # multipliers, so each model needs only its input/output pair maintained here.
+#
+# These three are Anthropic's published figures — do NOT "fix" the 1h multiplier
+# down to 1.25 to match ccusage. ccusage prices all cache creation at the 5m rate,
+# which under-prices 1h writes to 0.625x of what is actually billed; on a corpus
+# where 1h writes outnumber 5m ~300:1 that understates a monthly total by ~14%.
+# test_documented_cache_multipliers_are_not_silently_changed pins these.
 CACHE_WRITE_5M_MULTIPLIER = 1.25
 CACHE_WRITE_1H_MULTIPLIER = 2.0
 CACHE_READ_MULTIPLIER = 0.1

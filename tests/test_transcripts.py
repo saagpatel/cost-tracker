@@ -10,6 +10,9 @@ import pytest
 
 from cost_tracker.transcripts import (
     BASE_RATES,
+    CACHE_READ_MULTIPLIER,
+    CACHE_WRITE_1H_MULTIPLIER,
+    CACHE_WRITE_5M_MULTIPLIER,
     compute_cost,
     iter_usage_records,
     project_daily_costs,
@@ -99,6 +102,18 @@ class TestResolveRate:
     def test_every_rate_is_positive(self):
         for model, (inp, out) in BASE_RATES.items():
             assert inp > 0 and out > 0, model
+
+    def test_documented_cache_multipliers_are_not_silently_changed(self):
+        """Pin Anthropic's published cache multipliers.
+
+        The 1h multiplier is the one someone is most likely to "fix" downward to
+        make totals agree with ccusage. ccusage prices all cache creation at the
+        5m rate, which under-prices 1h writes to 0.625x of the billed amount;
+        matching it would understate a real monthly total by roughly 14%.
+        """
+        assert CACHE_READ_MULTIPLIER == 0.1
+        assert CACHE_WRITE_5M_MULTIPLIER == 1.25
+        assert CACHE_WRITE_1H_MULTIPLIER == 2.0
 
 
 class TestComputeCost:

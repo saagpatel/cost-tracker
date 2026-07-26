@@ -1,17 +1,22 @@
 """Calibrate the token-cost estimator against a real Anthropic invoice.
 
 Transcripts carry no cost field, so every figure this package reports is computed
-from tokens times a rate table. One term in that table is genuinely uncertain: the
-multiplier for 1-hour cache writes. Anthropic publishes 2x base input for 1h
-versus 1.25x for 5m, while ccusage appears to price all cache creation at the 5m
-rate. Because 1h writes outnumber 5m by roughly 300:1 on a real corpus, that one
-number swings a monthly total by more than 12%, and no amount of internal
-consistency-checking can settle it — both readings are self-consistent.
+from tokens times a rate table. The rates themselves are settled — Anthropic
+publishes 1.25x base input for a 5-minute cache write, 2x for 1-hour, and 0.1x for
+a read — and ``transcripts.py`` implements exactly those. This module is not
+needed to choose them.
 
-An invoice settles it. Given one or more (month, actually billed) pairs, this
-module scans each month once, reduces it to per-model token totals, then evaluates
-every candidate multiplier against those totals analytically. One scan, any number
-of hypotheses, no re-reading the corpus per candidate.
+What it is for is verifying the whole estimator against ground truth: confirming
+the rate table still matches reality after a price change, catching a model whose
+rates were never added, and quantifying how much billed spend has no transcript
+behind it. Given one or more (month, actually billed) pairs, it scans each month
+once, reduces it to per-model token totals, then evaluates candidate multipliers
+against those totals analytically. One scan, any number of hypotheses.
+
+A sweep over the 1h multiplier is the default because that term is where a
+regression is most likely to be introduced: ccusage prices all cache creation at
+the 5m rate, so anyone reconciling against ccusage will be tempted to "fix" 2x down
+to 1.25x. That would match ccusage and understate real spend by roughly 14%.
 
 Two conditions make an invoice unusable for this, and both are detected and
 reported rather than silently producing a confident wrong answer:
