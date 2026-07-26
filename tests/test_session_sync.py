@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -416,3 +417,254 @@ class TestSyncMalformedBreakdowns:
         breakdown = json.loads(row[0])
         assert breakdown["claude-sonnet-4-6"] == pytest.approx(1.0)
         assert "garbage" not in breakdown
+
+
+# ---------------------------------------------------------------------------
+# Tests: regression coverage for the 2026-07-26 cost-attribution defects
+#
+# Each class below pins one bug that made per-project attribution report a small
+# fraction of actual spend while the sync still returned zero errors. Every test
+# here fails on the prior code.
+# ---------------------------------------------------------------------------
+
+
+def _make_live_session(
+    session_id: str,
+    cost: float,
+    last_activity: str,
+    project_path: str = "Unknown Project",
+    model: str = "claude-opus-5",
+) -> dict:
+    """Build an entry in the installed-ccusage shape (`sessionId` + `projectPath`)."""
+    return {
+        "sessionId": session_id,
+        "projectPath": project_path,
+        "lastActivity": last_activity,
+        "totalCost": cost,
+        "modelBreakdowns": [{"modelName": model, "cost": cost}],
+    }
+
+
+def _fetch(db_path: Path, sql: str) -> list[tuple]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+
+class TestStartedAtRefreshesOnResync:
+    """`started_at` must track ccusage's lastActivity, not freeze at first sync.
+
+    The upsert previously refreshed cost_usd but not started_at, so most rows
+    stayed pinned to their first-sync date while their running total kept
+    climbing — dropping them out of every rolling-window query.
+    """
+
+    def test_started_at_follows_last_activity(self, tmp_db_for_sync):
+        first = [_make_live_session("-Users-d", 100.0, "2026-06-19")]
+        sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: first)
+
+        later = [_make_live_session("-Users-d", 10_676.95, "2026-07-25")]
+        sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: later)
+
+        rows = _fetch(
+            tmp_db_for_sync,
+            "SELECT started_at, cost_usd FROM session_costs WHERE session_id = '-Users-d'",
+        )
+        assert rows[0][0] == "2026-07-25", "started_at froze at the first-sync date"
+        assert rows[0][1] == pytest.approx(10_676.95)
+
+    def test_refreshed_row_stays_inside_the_window(self, tmp_db_for_sync):
+        """The end-to-end symptom: a stale stamp silently hides live spend."""
+        stale = [_make_live_session("uuid-active", 500.0, "2026-01-01")]
+        sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: stale)
+
+        fresh_date = date.today().isoformat()
+        fresh = [_make_live_session("uuid-active", 500.0, fresh_date)]
+        sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: fresh)
+
+        result = bridge_db.cost_top_projects(window_days=14, db_path=tmp_db_for_sync)
+        assert any(r.get("total_usd") == pytest.approx(500.0) for r in result)
+
+
+class TestSessionKeyCollision:
+    """`sessionId` is not unique across ccusage rows; the key must disambiguate.
+
+    Live output carries hundreds of entries all keyed `subagents`, differing only
+    by `projectPath`. Against a UNIQUE session_id column they upserted onto one
+    row, so only the last-written entry's spend survived.
+    """
+
+    def test_subagent_rows_do_not_overwrite_each_other(self, tmp_db_for_sync):
+        sessions = [
+            _make_live_session("subagents", 203.42, "2026-07-18", "-Users-d/parent-a"),
+            _make_live_session("subagents", 193.07, "2026-07-19", "-Users-d/parent-b"),
+            _make_live_session("subagents", 85.39, "2026-07-12", "-Users-d/parent-c"),
+        ]
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: sessions)
+
+        assert result["synced"] == 3
+        assert result["key_collisions"] == 0
+        total = _fetch(tmp_db_for_sync, "SELECT ROUND(SUM(cost_usd), 2) FROM session_costs")[0][0]
+        assert total == pytest.approx(203.42 + 193.07 + 85.39)
+
+    def test_workflow_rows_sharing_a_project_path_stay_distinct(self, tmp_db_for_sync):
+        """`wf_*` rows repeat a projectPath, so the key needs both components."""
+        shared = "-Users-d-Projects/parent-x/subagents/workflows"
+        sessions = [
+            _make_live_session("wf_aaa", 1.50, "2026-07-20", shared),
+            _make_live_session("wf_bbb", 2.50, "2026-07-20", shared),
+        ]
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: sessions)
+
+        assert result["synced"] == 2
+        total = _fetch(tmp_db_for_sync, "SELECT SUM(cost_usd) FROM session_costs")[0][0]
+        assert total == pytest.approx(4.0)
+
+    def test_plain_buckets_keep_their_bare_session_id(self, tmp_db_for_sync):
+        """Existing live rows must not duplicate under the new key scheme."""
+        sessions = [_make_live_session("-Users-d-Projects-evals", 5.0, "2026-07-20")]
+        sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: sessions)
+
+        ids = [r[0] for r in _fetch(tmp_db_for_sync, "SELECT session_id FROM session_costs")]
+        assert ids == ["-Users-d-Projects-evals"]
+
+    def test_subagent_rows_attribute_to_the_parent_project(self, tmp_db_for_sync):
+        """Subagent spend belongs to its parent's project, not to nothing."""
+        sessions = [
+            _make_live_session("subagents", 42.0, "2026-07-18", "-Users-d-Projects-evals/parent-a")
+        ]
+        sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: sessions)
+
+        rows = _fetch(tmp_db_for_sync, "SELECT project_name FROM session_costs")
+        assert rows[0][0] == "evals"
+
+
+class TestSupersededRowReconciliation:
+    """Rekeying leaves the legacy bare-id rows behind; they must not double-count.
+
+    The composite key rewrites `subagents` and `wf_*` spend under new ids. Left
+    alone, the old rows survive as duplicates of spend already re-recorded.
+    """
+
+    def test_legacy_bare_row_is_removed_after_rekey(self, tmp_db_for_sync):
+        legacy = [_make_live_session("subagents", 4.23, "2026-07-01")]
+        sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: legacy)
+        assert _fetch(tmp_db_for_sync, "SELECT COUNT(*) FROM session_costs")[0][0] == 1
+
+        rekeyed = [
+            _make_live_session("subagents", 203.42, "2026-07-18", "-Users-d/parent-a"),
+            _make_live_session("subagents", 193.07, "2026-07-19", "-Users-d/parent-b"),
+        ]
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: rekeyed)
+
+        assert result["superseded_removed"] == 1
+        ids = sorted(r[0] for r in _fetch(tmp_db_for_sync, "SELECT session_id FROM session_costs"))
+        assert ids == ["-Users-d/parent-a/subagents", "-Users-d/parent-b/subagents"]
+        total = _fetch(tmp_db_for_sync, "SELECT SUM(cost_usd) FROM session_costs")[0][0]
+        assert total == pytest.approx(203.42 + 193.07), "legacy row double-counted"
+
+    def test_history_ccusage_stopped_reporting_is_preserved(self, tmp_db_for_sync):
+        """A row merely absent from ccusage is history, not a duplicate.
+
+        Without this restriction one truncated ccusage response would delete real
+        cost records.
+        """
+        first = [
+            _make_live_session("-Users-d-Projects-old", 99.0, "2026-05-01"),
+            _make_live_session("subagents", 1.0, "2026-05-02", "-Users-d/parent-a"),
+        ]
+        sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: first)
+
+        later = [_make_live_session("subagents", 2.0, "2026-07-02", "-Users-d/parent-a")]
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: later)
+
+        assert result["superseded_removed"] == 0
+        ids = sorted(r[0] for r in _fetch(tmp_db_for_sync, "SELECT session_id FROM session_costs"))
+        assert "-Users-d-Projects-old" in ids, "unreported history must survive"
+
+    def test_bucket_still_reported_under_its_bare_id_is_kept(self, tmp_db_for_sync):
+        """A bare id this run still writes is not superseded."""
+        sessions = [
+            _make_live_session("-Users-d", 500.0, "2026-07-20"),
+            _make_live_session("subagents", 5.0, "2026-07-20", "-Users-d/parent-a"),
+        ]
+        sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: sessions)
+        sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: sessions)
+
+        ids = sorted(r[0] for r in _fetch(tmp_db_for_sync, "SELECT session_id FROM session_costs"))
+        assert ids == ["-Users-d", "-Users-d/parent-a/subagents"]
+
+
+class TestSyncCounterHonesty:
+    """`synced` must count rows written, not insert attempts.
+
+    Counting attempts is what let the collision hide behind "489 synced, 0 errors".
+    """
+
+    def test_reports_input_entries_and_collisions(self, tmp_db_for_sync):
+        collided = "-Users-d/parent-a"
+        sessions = [
+            _make_live_session("subagents", 10.0, "2026-07-18", collided),
+            _make_live_session("subagents", 20.0, "2026-07-19", collided),
+        ]
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: sessions)
+
+        assert result["input_entries"] == 2
+        assert result["synced"] == 1, "two entries collapsed onto one key"
+        assert result["key_collisions"] == 1, "the collapse must be reported, not hidden"
+
+
+class TestLifetimeBucketGranularity:
+    """Directory buckets hold all-time spend and must stay out of windowed views.
+
+    Windowing a lifetime total is bimodal: a dominant home-directory bucket either
+    vanished from a 14-day window or landed in a 60-day one whole. Neither is
+    window spend.
+    """
+
+    def test_bucket_excluded_from_window_even_when_recent(self, tmp_db_for_sync):
+        today = date.today().isoformat()
+        sessions = [
+            _make_live_session("-Users-d", 10_676.95, today),
+            _make_live_session("uuid-real", 12.0, today, "-Users-d/parent-a"),
+        ]
+        sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: sessions)
+
+        result = bridge_db.cost_top_projects(window_days=14, db_path=tmp_db_for_sync)
+        windowed = [r for r in result if "total_usd" in r]
+        assert sum(r["total_usd"] for r in windowed) == pytest.approx(12.0)
+
+    def test_excluded_spend_is_reported_not_silently_dropped(self, tmp_db_for_sync):
+        today = date.today().isoformat()
+        sessions = [
+            _make_live_session("-Users-d", 10_676.95, today),
+            _make_live_session("uuid-real", 12.0, today, "-Users-d/parent-a"),
+        ]
+        sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: sessions)
+
+        result = bridge_db.cost_top_projects(window_days=14, db_path=tmp_db_for_sync)
+        advisory = next((r for r in result if r.get("granularity") == "lifetime_excluded"), None)
+        assert advisory is not None, "held-back spend must be surfaced"
+        assert advisory["excluded_usd"] == pytest.approx(10_676.95)
+        assert advisory["bucket_count"] == 1
+
+    def test_lifetime_buckets_reports_all_time_spend(self, tmp_db_for_sync):
+        sessions = [
+            _make_live_session("-Users-d", 10_676.95, "2026-06-19"),
+            _make_live_session("-Users-d-Projects-evals", 257.09, "2026-07-01"),
+            _make_live_session("uuid-real", 12.0, "2026-07-20", "-Users-d/parent-a"),
+        ]
+        sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: sessions)
+
+        buckets = bridge_db.cost_lifetime_buckets(db_path=tmp_db_for_sync)
+        by_project = {b["project"]: b for b in buckets}
+        assert by_project["home-adhoc"]["total_usd"] == pytest.approx(10_676.95)
+        assert by_project["evals"]["total_usd"] == pytest.approx(257.09)
+        assert all(b["granularity"] == "lifetime" for b in buckets)
+        assert "uuid-real" not in by_project, "session rows are not lifetime buckets"
+
+    def test_lifetime_buckets_missing_db_returns_error(self, tmp_path):
+        result = bridge_db.cost_lifetime_buckets(db_path=tmp_path / "nonexistent.db")
+        assert result[0]["error"] == "bridge_db_unavailable"

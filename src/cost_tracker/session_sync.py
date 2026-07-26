@@ -18,6 +18,9 @@ BRIDGE_DB_PATH = Path.home() / ".local" / "share" / "bridge-db" / "bridge.db"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 HOME_ADHOC_PROJECT = "home-adhoc"
 
+# ccusage emits this literal in `projectPath` when it cannot resolve a real path.
+UNKNOWN_PROJECT_PATH = "Unknown Project"
+
 # session_costs is owned and created by bridge-db, which holds the single,
 # version-gated schema definition (bridge_db/db.py, ensure_schema). cost-tracker is
 # a pure consumer: it upserts into the canonical table and never defines or creates
@@ -116,6 +119,64 @@ def _decode_project_name(dirname: str) -> str | None:
 def _is_system_fragment(candidate: str) -> bool:
     """Return True for values that should be skipped instead of bucketed."""
     return len(candidate) <= 1 or candidate.lower() in {"d", "tmp"}
+
+
+def _entry_project_path(session: dict[str, Any]) -> str:
+    """Return the ccusage ``projectPath`` when it carries real path structure."""
+    raw = session.get("projectPath")
+    if not isinstance(raw, str):
+        return ""
+    candidate = raw.strip()
+    if not candidate or candidate == UNKNOWN_PROJECT_PATH:
+        return ""
+    return candidate
+
+
+def _session_key(session: dict[str, Any], session_id: str) -> str:
+    """
+    Build a collision-free primary key for one ccusage entry.
+
+    ccusage reuses ``sessionId`` across rows that are not the same unit of spend:
+    every per-parent subagent rollup is emitted as ``sessionId="subagents"``, and
+    workflow rows repeat a ``wf_*`` id under different parents. Because
+    ``session_costs.session_id`` is UNIQUE, keying on ``sessionId`` alone made
+    hundreds of entries collapse into a fraction of that many rows — the whole
+    subagent tier upserted onto one row, so all but the last-written entry was
+    destroyed on every sync while the return value still reported zero errors.
+
+    ``projectPath`` disambiguates both cases: it carries
+    ``<bucket>/<parent-uuid>[/subagents/workflows]``, so the composite
+    ``<projectPath>/<sessionId>`` is unique where a bare id is not (verified
+    collision-free against a full live ccusage dump). Entries without real path
+    structure keep their bare ``sessionId``, so plain directory buckets retain
+    the keys already stored and do not duplicate on the next sync.
+    """
+    project_path = _entry_project_path(session)
+    return f"{project_path}/{session_id}" if project_path else session_id
+
+
+def _project_for_entry(
+    session: dict[str, Any],
+    session_id: str,
+    session_to_project: dict[str, str],
+) -> str | None:
+    """
+    Resolve the owning project for one ccusage entry.
+
+    Subagent and workflow rows carry their parent session's bucket as the first
+    segment of ``projectPath``, so they attribute to the same project as their
+    parent instead of decoding to nothing and landing unmapped.
+
+    Falls back to the two historical shapes: newer ``period``-format entries look
+    up the filesystem session map, installed-format entries decode the directory
+    name directly.
+    """
+    project_path = _entry_project_path(session)
+    if project_path:
+        return _decode_project_name(project_path.split("/", 1)[0])
+    if session.get("period"):
+        return session_to_project.get(session_id)
+    return _decode_project_name(session_id)
 
 
 def _safe_encoded_path(value: str) -> str:
@@ -217,6 +278,45 @@ def _fallback_recover_project_name(encoded_project: str) -> str | None:
     return " ".join(words)
 
 
+def _remove_superseded_rows(conn: sqlite3.Connection, superseded: set[str]) -> int:
+    """
+    Delete legacy rows that this sync replaced with a composite key.
+
+    Scope is deliberately narrow. A row qualifies only when ccusage still reports
+    that bare id AND this run rewrote the same spend under a composite key, which
+    makes the legacy row a provable duplicate. Rows that ccusage merely stopped
+    reporting are historical records and are never touched — without that
+    restriction a single truncated ccusage response would delete real cost history.
+
+    At introduction this cleared the legacy ``subagents`` row plus every bare
+    ``wf_*`` row, all of which would otherwise have been counted twice.
+    """
+    if not superseded:
+        return 0
+
+    ordered = sorted(superseded)
+    placeholders = ",".join("?" * len(ordered))
+
+    # session_classification carries an FK to session_costs(session_id). Clear the
+    # child rows first so the delete holds whether or not FK enforcement is on.
+    if (
+        conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='session_classification'"
+        ).fetchone()
+        is not None
+    ):
+        conn.execute(
+            f"DELETE FROM session_classification WHERE session_id IN ({placeholders})",
+            ordered,
+        )
+
+    cursor = conn.execute(
+        f"DELETE FROM session_costs WHERE session_id IN ({placeholders})",
+        ordered,
+    )
+    return cursor.rowcount or 0
+
+
 def _build_session_project_map(projects_dir: Path = CLAUDE_PROJECTS_DIR) -> dict[str, str]:
     """
     Scan ~/.claude/projects/ and build {session_id: project_name} mapping.
@@ -310,8 +410,17 @@ def sync_session_costs(
         }
 
     conn: sqlite3.Connection | None = None
-    synced = 0
+    # Distinct keys actually written. Counting insert *attempts* is what let the
+    # sessionId collision hide: every attempt was reported as a sync even though
+    # repeats overwrote each other, so the count looked healthy while rows were
+    # being destroyed.
+    written: set[str] = set()
+    # Bare ccusage ids that this run rewrote under a composite key. Their legacy
+    # rows are duplicates of spend we just re-recorded and must be reconciled away.
+    rekeyed_from: set[str] = set()
+    key_collisions = 0
     skipped = 0
+    superseded_removed = 0
     errors: list[str] = []
 
     try:
@@ -335,18 +444,17 @@ def sync_session_costs(
             }
 
         for session in sessions:
-            session_id = session.get("period") or session.get("sessionId")
-            if not session_id:
+            raw_id = session.get("period") or session.get("sessionId")
+            if not raw_id:
                 skipped += 1
                 continue
 
-            # Two ccusage formats:
-            # - newer (npx ccusage@latest): period=UUID → look up via filesystem map
-            # - installed ccusage: sessionId=dir-name → decode directly
-            if session.get("period"):
-                project_name = session_to_project.get(session_id)
-            else:
-                project_name = _decode_project_name(session_id)
+            # ccusage reuses sessionId across distinct units of spend; _session_key
+            # folds in projectPath so those rows stop overwriting each other.
+            session_id = _session_key(session, raw_id)
+            if session_id != raw_id:
+                rekeyed_from.add(raw_id)
+            project_name = _project_for_entry(session, raw_id, session_to_project)
 
             metadata = session.get("metadata", {})
             started_at = metadata.get("lastActivity") or session.get("lastActivity", "")
@@ -367,6 +475,13 @@ def sync_session_costs(
                         cost_usd        = excluded.cost_usd,
                         model_breakdown = excluded.model_breakdown,
                         project_name    = COALESCE(excluded.project_name, project_name),
+                        -- started_at MUST refresh. ccusage reports it as the row's
+                        -- lastActivity, and cost_usd is a running total keyed to it.
+                        -- Omitting it froze the majority of rows at their first-sync
+                        -- date while their cost kept climbing, so every rolling-window
+                        -- query dropped them and per-project attribution reported only
+                        -- a few percent of actual spend.
+                        started_at      = excluded.started_at,
                         recorded_at     = strftime('%Y-%m-%dT%H:%M:%SZ','now')
                     """,
                     (
@@ -377,22 +492,38 @@ def sync_session_costs(
                         json.dumps(model_breakdown),
                     ),
                 )
-                synced += 1
+                if session_id in written:
+                    key_collisions += 1
+                written.add(session_id)
             except sqlite3.Error as exc:
                 errors.append(f"session {session_id}: {exc}")
 
+        superseded_removed = _remove_superseded_rows(conn, rekeyed_from - written)
         conn.commit()
 
     except sqlite3.OperationalError as exc:
         return {
-            "synced": synced,
+            "synced": len(written),
             "skipped": skipped,
             "errors": [f"bridge_db operational error: {exc}"],
         }
     except sqlite3.Error as exc:
-        return {"synced": synced, "skipped": skipped, "errors": [f"bridge_db_error: {exc}"]}
+        return {
+            "synced": len(written),
+            "skipped": skipped,
+            "errors": [f"bridge_db_error: {exc}"],
+        }
     finally:
         if conn is not None:
             conn.close()
 
-    return {"synced": synced, "skipped": skipped, "errors": errors}
+    return {
+        "synced": len(written),
+        "skipped": skipped,
+        "errors": errors,
+        # Surfaced so a future key collision cannot hide behind a healthy-looking
+        # count again: input_entries > synced means rows overwrote each other.
+        "input_entries": len(sessions),
+        "key_collisions": key_collisions,
+        "superseded_removed": superseded_removed,
+    }

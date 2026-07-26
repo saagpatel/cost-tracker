@@ -13,6 +13,21 @@ BRIDGE_DB_PATH = Path.home() / ".local" / "share" / "bridge-db" / "bridge.db"
 VALID_SYSTEMS = frozenset({"cc", "codex", "claude_ai", "notion_os", "personal_ops"})
 _MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 
+# ccusage writes two different row granularities into session_costs:
+#   * directory buckets   — session_id like "-Users-d": ONE row carrying that
+#     directory's ALL-TIME spend, stamped with a single lastActivity date
+#   * session-scoped rows — UUIDs, plus "<bucket>/<uuid>/subagents" and workflow
+#     rows, each covering the spend of one session
+#
+# Only session-scoped rows can answer "how much in the last N days". Windowing a
+# lifetime total is bimodal: a busy home-directory bucket can dominate the table,
+# and against a rolling window it either drops out wholesale (leaving a few
+# percent of real spend visible) or lands entirely inside it (counting months of
+# history as if it happened this fortnight). Neither figure is window spend, so
+# windowed queries select session rows only and the lifetime buckets are reported
+# separately by cost_lifetime_buckets().
+_LIFETIME_BUCKET_SQL = "(session_id GLOB '-*' AND session_id NOT GLOB '*/*')"
+
 # The live DB CHECK constraint only covers a subset of systems (no claude_ai).
 # We enforce the full set here and let the DB reject anything else.
 # When inserting claude_ai, the DB will raise; callers should handle that.
@@ -29,7 +44,14 @@ def cost_top_projects(
     window_days: int = 14, db_path: Path = BRIDGE_DB_PATH
 ) -> list[dict[str, Any]]:
     """
-    Aggregate session_costs over the last window_days, grouped by project.
+    Aggregate session-granularity session_costs over the last window_days, grouped
+    by project.
+
+    ccusage directory buckets carry all-time totals against a single date and are
+    excluded — they cannot be windowed without inventing a number. When any exist,
+    a trailing advisory entry reports how much was held back, so the caller can
+    never silently read a windowed figure as if it were total spend. Use
+    cost_lifetime_buckets() for the all-time per-project view.
 
     Falls back to cost_records system totals if session_costs table doesn't exist,
     returning a note to run sync first.
@@ -47,69 +69,50 @@ def cost_top_projects(
         with conn:
             try:
                 rows = conn.execute(
-                    """
-                    SELECT project_name, SUM(cost_usd) as total_usd, COUNT(*) as session_count
+                    f"""
+                    SELECT COALESCE(project_name, '(unmapped)') AS project_name,
+                           SUM(cost_usd)                        AS total_usd,
+                           COUNT(*)                             AS session_count
                     FROM session_costs
                     WHERE started_at >= ?
-                      AND project_name IS NOT NULL
-                    GROUP BY project_name
+                      AND NOT {_LIFETIME_BUCKET_SQL}
+                    GROUP BY COALESCE(project_name, '(unmapped)')
                     ORDER BY total_usd DESC
                     """,
                     (cutoff,),
                 ).fetchall()
 
-                if not rows:
-                    # Table exists but no data — include unmapped sessions
-                    unmapped = conn.execute(
-                        """
-                        SELECT SUM(cost_usd) as total_usd, COUNT(*) as session_count
-                        FROM session_costs
-                        WHERE started_at >= ?
-                          AND project_name IS NULL
-                        """,
-                        (cutoff,),
-                    ).fetchone()
-                    result = []
-                    if unmapped and unmapped["total_usd"]:
-                        result.append(
-                            {
-                                "project": "(unmapped)",
-                                "total_usd": round(unmapped["total_usd"], 6),
-                                "session_count": unmapped["session_count"],
-                            }
-                        )
-                    return result
+                result: list[dict[str, Any]] = [
+                    {
+                        "project": row["project_name"],
+                        "total_usd": round(row["total_usd"], 6),
+                        "session_count": row["session_count"],
+                    }
+                    for row in rows
+                ]
 
-                result = []
-                for row in rows:
-                    result.append(
-                        {
-                            "project": row["project_name"],
-                            "total_usd": round(row["total_usd"], 6),
-                            "session_count": row["session_count"],
-                        }
-                    )
-
-                # Also include unmapped sessions
-                unmapped = conn.execute(
-                    """
-                    SELECT SUM(cost_usd) as total_usd, COUNT(*) as session_count
+                held_back = conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS bucket_count, COALESCE(SUM(cost_usd), 0) AS total_usd
                     FROM session_costs
-                    WHERE started_at >= ?
-                      AND project_name IS NULL
-                    """,
-                    (cutoff,),
+                    WHERE {_LIFETIME_BUCKET_SQL}
+                    """
                 ).fetchone()
-                if unmapped and unmapped["total_usd"]:
+                if held_back and held_back["bucket_count"]:
                     result.append(
                         {
-                            "project": "(unmapped)",
-                            "total_usd": round(unmapped["total_usd"], 6),
-                            "session_count": unmapped["session_count"],
+                            "granularity": "lifetime_excluded",
+                            "bucket_count": held_back["bucket_count"],
+                            "excluded_usd": round(held_back["total_usd"], 6),
+                            "note": (
+                                "ccusage directory buckets hold all-time spend against a "
+                                "single date and cannot be windowed; excluded from the "
+                                "figures above. Call cost_lifetime_buckets() for that view."
+                            ),
                         }
                     )
 
-                return sorted(result, key=lambda x: x["total_usd"], reverse=True)
+                return result
 
             except sqlite3.OperationalError:
                 # session_costs table doesn't exist — fall back to cost_records
@@ -137,6 +140,56 @@ def cost_top_projects(
                 for row in rows
             ]
 
+    except sqlite3.Error as exc:
+        return [{"error": "bridge_db_error", "detail": str(exc)}]
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def cost_lifetime_buckets(db_path: Path = BRIDGE_DB_PATH) -> list[dict[str, Any]]:
+    """
+    Return all-time per-project spend from ccusage directory buckets.
+
+    This is the honest home for the rows cost_top_projects excludes. Each bucket
+    is one ccusage directory rollup covering that directory's entire history, so
+    these totals answer "how much has this project ever cost" — never "how much
+    in the last N days". There is deliberately no window parameter: the source
+    rows carry a single date for an arbitrarily long span, so any window applied
+    here would be fabricated.
+
+    Returns list of {project, total_usd, bucket_count, last_activity} sorted by
+    total_usd desc.
+    """
+    if not db_path.exists():
+        return [{"error": "bridge_db_unavailable", "detail": str(db_path)}]
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _connect(db_path, readonly=True)
+        with conn:
+            rows = conn.execute(
+                f"""
+                SELECT COALESCE(project_name, '(unmapped)') AS project_name,
+                       SUM(cost_usd)                        AS total_usd,
+                       COUNT(*)                             AS bucket_count,
+                       MAX(started_at)                      AS last_activity
+                FROM session_costs
+                WHERE {_LIFETIME_BUCKET_SQL}
+                GROUP BY COALESCE(project_name, '(unmapped)')
+                ORDER BY total_usd DESC
+                """
+            ).fetchall()
+            return [
+                {
+                    "project": row["project_name"],
+                    "total_usd": round(row["total_usd"], 6),
+                    "bucket_count": row["bucket_count"],
+                    "last_activity": row["last_activity"],
+                    "granularity": "lifetime",
+                }
+                for row in rows
+            ]
     except sqlite3.Error as exc:
         return [{"error": "bridge_db_error", "detail": str(exc)}]
     finally:
