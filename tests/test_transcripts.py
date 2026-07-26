@@ -49,7 +49,7 @@ def _entry(
     *,
     day: str = "2026-07-20",
     model: str = "claude-opus-5",
-    cwd: str = "/Users/d/Projects/demo",
+    cwd: str = "/workspace/Projects/demo",
     usage: dict | None = None,
     sidechain: bool = False,
     session_id: str = "sess-1",
@@ -135,26 +135,26 @@ class TestComputeCost:
 
 class TestProjectFromCwd:
     def test_projects_directory(self):
-        assert project_from_cwd("/Users/d/Projects/cost-tracker", home=Path("/Users/d")) == (
+        assert project_from_cwd("/workspace/Projects/cost-tracker", home=Path("/workspace")) == (
             "cost-tracker"
         )
 
     def test_nested_path_resolves_to_the_project_root(self):
-        assert project_from_cwd("/Users/d/Projects/ink/src/lib", home=Path("/Users/d")) == "ink"
+        assert project_from_cwd("/workspace/Projects/ink/src/lib", home=Path("/workspace")) == "ink"
 
     def test_dashed_and_spaced_names_survive_exactly(self):
         """The cwd path is real, so no lossy dash-decoding is needed."""
-        assert project_from_cwd("/Users/d/Projects/Devil's Advocate", home=Path("/Users/d")) == (
+        assert project_from_cwd("/workspace/Projects/Devil's Advocate", home=Path("/workspace")) == (
             "Devil's Advocate"
         )
 
     def test_local_share_service(self):
-        assert project_from_cwd("/Users/d/.local/share/personal-ops", home=Path("/Users/d")) == (
+        assert project_from_cwd("/workspace/.local/share/personal-ops", home=Path("/workspace")) == (
             "personal-ops"
         )
 
     def test_bare_home_is_the_adhoc_bucket(self):
-        assert project_from_cwd("/Users/d", home=Path("/Users/d")) == "home-adhoc"
+        assert project_from_cwd("/workspace", home=Path("/workspace")) == "home-adhoc"
 
     def test_temp_sandboxes_bucket_as_transient(self):
         assert project_from_cwd("/private/var/folders/gf/T/frontier-s1") == "(transient)"
@@ -266,13 +266,13 @@ class TestIterUsageRecords:
             transcripts_dir,
             "-Users-d-Projects-alpha",
             "sess-a",
-            [_entry("m1", cwd="/Users/d/Projects/alpha")],
+            [_entry("m1", cwd="/workspace/Projects/alpha")],
         )
         _write(
             transcripts_dir,
             "-Users-d-Projects-beta",
             "sess-b",
-            [_entry("m2", cwd="/Users/d/Projects/beta")],
+            [_entry("m2", cwd="/workspace/Projects/beta")],
         )
         assert {r.project for r in iter_usage_records(transcripts_dir)} == {"alpha", "beta"}
 
@@ -352,13 +352,13 @@ class TestProjectWindowCosts:
             transcripts_dir,
             "-Users-d-Projects-small",
             "s1",
-            [_entry("m1", cwd="/Users/d/Projects/small", usage=_usage(output_tokens=100_000))],
+            [_entry("m1", cwd="/workspace/Projects/small", usage=_usage(output_tokens=100_000))],
         )
         _write(
             transcripts_dir,
             "-Users-d-Projects-big",
             "s2",
-            [_entry("m2", cwd="/Users/d/Projects/big", usage=_usage(output_tokens=900_000))],
+            [_entry("m2", cwd="/workspace/Projects/big", usage=_usage(output_tokens=900_000))],
         )
         result = project_window_costs(
             window_days=14, projects_dir=transcripts_dir, today=date(2026, 7, 25)
@@ -393,15 +393,15 @@ class TestProjectDailyCosts:
             "-Users-d-Projects-alpha",
             "s1",
             [
-                _entry("m1", day="2026-07-01", cwd="/Users/d/Projects/alpha"),
-                _entry("m2", day="2026-07-02", cwd="/Users/d/Projects/alpha"),
+                _entry("m1", day="2026-07-01", cwd="/workspace/Projects/alpha"),
+                _entry("m2", day="2026-07-02", cwd="/workspace/Projects/alpha"),
             ],
         )
         _write(
             transcripts_dir,
             "-Users-d-Projects-beta",
             "s2",
-            [_entry("m3", day="2026-07-01", cwd="/Users/d/Projects/beta")],
+            [_entry("m3", day="2026-07-01", cwd="/workspace/Projects/beta")],
         )
         result = project_daily_costs("2026-07-01", "2026-07-02", projects_dir=transcripts_dir)
 
