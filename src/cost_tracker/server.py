@@ -10,6 +10,7 @@ from cost_tracker import bridge_db as _bridge_db
 from cost_tracker import ccusage as _ccusage
 from cost_tracker import classify as _classify
 from cost_tracker import thresholds as _thresholds
+from cost_tracker import transcripts as _transcripts
 
 app = FastMCP(
     name="cost-tracker",
@@ -174,6 +175,56 @@ def cost_lifetime_buckets() -> list[dict[str, Any]]:
     Returns [{error, detail}] if bridge-db is unavailable.
     """
     return _bridge_db.cost_lifetime_buckets()
+
+
+@app.tool()
+def cost_project_window(window_days: int = 14) -> dict[str, Any]:
+    """
+    Per-project spend over a genuine rolling window, computed from transcripts.
+
+    This is the query the ccusage feed cannot answer: its per-directory rows carry
+    all-time spend against a single date, and --since filters which rows appear
+    rather than the money inside them. This reads ~/.claude/projects/*.jsonl
+    directly, attributing every message to its own day and working directory.
+
+    Cost is estimated from tokens (cost_basis="token_estimate") and lands within
+    ~2.5% of ccusage's total; the difference is a consistent rate-table bias, so
+    comparisons between projects and weeks are unaffected.
+
+    Shape: {since, until, window_days, total_usd, projects: [...], cost_basis}
+    where each project carries {project, total_usd, subagent_usd, session_count}.
+    """
+    return _transcripts.project_window_costs(window_days=window_days)
+
+
+@app.tool()
+def cost_project_daily(since: str, until: str | None = None) -> dict[str, Any]:
+    """
+    Spend broken down by day and project across an explicit date range.
+
+    Args:
+        since: Inclusive start date, "YYYY-MM-DD".
+        until: Inclusive end date, "YYYY-MM-DD". Defaults to today.
+
+    Shape: {since, until, cost_basis, days: [{day, total_usd, projects: [...]}]}
+    """
+    return _transcripts.project_daily_costs(since=since, until=until)
+
+
+@app.tool()
+def cost_unpriced_models() -> dict[str, Any]:
+    """
+    Report billed messages whose model has no entry in the local rate table.
+
+    A newly launched model would otherwise contribute zero to every transcript
+    -derived total while all reported numbers still looked healthy. Anything
+    listed here means the rate table needs a new entry before its figures can be
+    trusted.
+
+    Shape: {unpriced: {model_id: message_count}, healthy: bool}
+    """
+    counts = _transcripts.summarise_unpriced()
+    return {"unpriced": counts, "healthy": not counts}
 
 
 @app.tool()
