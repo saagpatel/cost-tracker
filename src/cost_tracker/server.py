@@ -144,15 +144,36 @@ def cost_bridge_staleness() -> dict[str, Any]:
 @app.tool()
 def cost_top_projects(window_days: int = 14) -> list[dict[str, Any]]:
     """
-    Return bridge-db cost_records aggregated by project, highest spend first.
+    Return windowed per-project spend, highest first.
+
+    Covers session-granularity rows only. ccusage directory buckets hold all-time
+    spend against a single date, so they cannot be windowed and are excluded; when
+    any exist, a trailing {granularity: "lifetime_excluded", ...} entry reports how
+    much was held back. Use cost_lifetime_buckets() for all-time per-project spend.
 
     Args:
-        window_days: Rolling window in days (default 14). Filters by month >= cutoff month.
+        window_days: Rolling window in days (default 14).
 
-    Each entry: {project, total_usd, record_count}
+    Each entry: {project, total_usd, session_count}
     Returns [{error, detail}] if bridge-db is unavailable.
     """
     return _bridge_db.cost_top_projects(window_days=window_days)
+
+
+@app.tool()
+def cost_lifetime_buckets() -> list[dict[str, Any]]:
+    """
+    Return all-time per-project spend from ccusage directory buckets.
+
+    The companion to cost_top_projects: these rows are each a directory's entire
+    history rolled into one record, so they answer "how much has this project ever
+    cost" and never "how much in the last N days". No window parameter exists
+    because the underlying rows carry a single date for an arbitrarily long span.
+
+    Each entry: {project, total_usd, bucket_count, last_activity, granularity}
+    Returns [{error, detail}] if bridge-db is unavailable.
+    """
+    return _bridge_db.cost_lifetime_buckets()
 
 
 @app.tool()

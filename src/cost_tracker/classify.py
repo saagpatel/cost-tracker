@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from cost_tracker.bridge_db import _LIFETIME_BUCKET_SQL
+
 BRIDGE_DB_PATH = Path.home() / ".local" / "share" / "bridge-db" / "bridge.db"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 ROUTING_RULES_PATH = Path.home() / ".claude" / "rules" / "auto-team.md"
@@ -335,7 +337,9 @@ def _confidence(
         score += 0.2
     if task_class != "unknown":
         score += 0.25
-    if signals.tool_counts or _has_any(signals.combined_text, _ARCHITECTURE_KEYWORDS | _REVIEW_KEYWORDS):
+    if signals.tool_counts or _has_any(
+        signals.combined_text, _ARCHITECTURE_KEYWORDS | _REVIEW_KEYWORDS
+    ):
         score += 0.15
     if role != "unknown":
         score += 0.05
@@ -523,11 +527,11 @@ def cost_routing_violations(
                 "detail": "session_classification table not found; run bridge-db schema v12",
             }
         bucket_rows = conn.execute(
-            """
+            f"""
             SELECT COALESCE(sc.project_name, 'unmapped') AS project_name,
                    COUNT(*) AS over_powered_rows,
-                   SUM(CASE WHEN sc.session_id GLOB '-*' THEN 1 ELSE 0 END) AS bucket_rows,
-                   SUM(CASE WHEN sc.session_id NOT GLOB '-*' THEN 1 ELSE 0 END) AS session_rows,
+                   SUM(CASE WHEN {_LIFETIME_BUCKET_SQL} THEN 1 ELSE 0 END) AS bucket_rows,
+                   SUM(CASE WHEN NOT {_LIFETIME_BUCKET_SQL} THEN 1 ELSE 0 END) AS session_rows,
                    ROUND(SUM(sc.cost_usd), 2) AS wasted_usd_upper_bound
             FROM session_costs sc
             JOIN session_classification cl USING (session_id)
