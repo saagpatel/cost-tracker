@@ -144,14 +144,14 @@ class TestProjectFromCwd:
 
     def test_dashed_and_spaced_names_survive_exactly(self):
         """The cwd path is real, so no lossy dash-decoding is needed."""
-        assert project_from_cwd("/workspace/Projects/Devil's Advocate", home=Path("/workspace")) == (
-            "Devil's Advocate"
-        )
+        assert project_from_cwd(
+            "/workspace/Projects/Devil's Advocate", home=Path("/workspace")
+        ) == ("Devil's Advocate")
 
     def test_local_share_service(self):
-        assert project_from_cwd("/workspace/.local/share/personal-ops", home=Path("/workspace")) == (
-            "personal-ops"
-        )
+        assert project_from_cwd(
+            "/workspace/.local/share/personal-ops", home=Path("/workspace")
+        ) == ("personal-ops")
 
     def test_bare_home_is_the_adhoc_bucket(self):
         assert project_from_cwd("/workspace", home=Path("/workspace")) == "home-adhoc"
@@ -306,6 +306,45 @@ class TestIterUsageRecords:
 
     def test_missing_directory_yields_nothing(self, tmp_path):
         assert list(iter_usage_records(tmp_path / "absent")) == []
+
+    def test_nested_subagent_transcripts_are_included(self, transcripts_dir):
+        """Subagent transcripts sit a level deeper and are most of a real corpus.
+
+        A one-level glob drops every one of them. That shipped once: it removed
+        tens of thousands of billed messages while the grand total still looked
+        right, because the omission cancelled an overcount elsewhere.
+        """
+        subagent_dir = transcripts_dir / "-Users-d-Projects-demo" / "parent-uuid" / "subagents"
+        subagent_dir.mkdir(parents=True)
+        (subagent_dir / "agent-abc123.jsonl").write_text(
+            json.dumps(_entry("sub-1", sidechain=True)) + "\n", encoding="utf-8"
+        )
+        _write(transcripts_dir, "-Users-d-Projects-demo", "sess-a", [_entry("lead-1")])
+
+        records = list(iter_usage_records(transcripts_dir))
+        assert sorted(r.is_subagent for r in records) == [False, True]
+
+    def test_subagent_messages_are_not_duplicates_of_the_parent(self, transcripts_dir):
+        """Recursion must add real spend, never double-count the parent's."""
+        subagent_dir = transcripts_dir / "-Users-d-Projects-demo" / "parent-uuid" / "subagents"
+        subagent_dir.mkdir(parents=True)
+        (subagent_dir / "agent-abc123.jsonl").write_text(
+            json.dumps(_entry("sub-1", sidechain=True)) + "\n", encoding="utf-8"
+        )
+        _write(transcripts_dir, "-Users-d-Projects-demo", "sess-a", [_entry("lead-1")])
+
+        total = sum(r.cost_usd for r in iter_usage_records(transcripts_dir))
+        assert total == pytest.approx(50.0)
+
+    def test_unpriced_scan_covers_nested_files_too(self, transcripts_dir):
+        """Both scanners share one walk, so their coverage cannot drift apart."""
+        subagent_dir = transcripts_dir / "-Users-d-Projects-demo" / "parent-uuid" / "subagents"
+        subagent_dir.mkdir(parents=True)
+        (subagent_dir / "agent-abc123.jsonl").write_text(
+            json.dumps(_entry("sub-1", model="claude-nextgen-9", sidechain=True)) + "\n",
+            encoding="utf-8",
+        )
+        assert summarise_unpriced(transcripts_dir) == {"claude-nextgen-9": 1}
 
 
 class TestSummariseUnpriced:

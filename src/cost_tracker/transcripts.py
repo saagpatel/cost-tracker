@@ -12,11 +12,27 @@ ccusage itself reads, and they carry strictly more: a per-message ``timestamp``
 the real absolute working directory, so attribution needs no lossy reverse-decode
 of a dash-mangled directory name.
 
-Cost is computed from tokens because transcripts carry no cost field. Against a
-full local corpus this lands within ~2.5% of ccusage's own total; the gap is rate
--table drift (ccusage fetches live pricing, this module uses a reviewed static
-table), and it is a consistent bias rather than noise, so comparisons between
-projects and between weeks are unaffected.
+Cost is computed from tokens because transcripts carry no cost field, so every
+figure here is an estimate (``cost_basis="token_estimate"``) and neither this nor
+ccusage has been reconciled against a real invoice.
+
+It deliberately diverges from ccusage in two ways, both of which raise this
+module's totals:
+
+1. **Subagent transcripts are included.** They live one level deeper, at
+   ``<dir>/<parent-uuid>/subagents/agent-*.jsonl``, carry their own message ids,
+   and are the majority of files in a real corpus. ``ccusage session`` reports
+   them as a separate ``subagents`` bucket rather than against their project.
+2. **1h cache writes bill at 2x base input**, per Anthropic's published cache
+   pricing, versus 1.25x for 5m. ccusage appears to price all cache creation at
+   the 5m rate, and since 1h writes outnumber 5m by roughly 300:1 on a real
+   corpus, this single multiplier accounts for most of the remaining gap.
+
+A caution learned building this: an early version matched ccusage's grand total to
+within 2.5% while being wrong twice over — it overcounted the main tier and
+omitted the subagent tier entirely, and the two errors happened to cancel.
+Validating an estimator on one aggregate number can hide compensating faults; check
+the tiers separately.
 """
 
 from __future__ import annotations
@@ -216,21 +232,27 @@ def project_from_cwd(cwd: str | None, home: Path | None = None) -> str | None:
     return segments[0]
 
 
-def iter_usage_records(
-    projects_dir: Path = CLAUDE_PROJECTS_DIR,
-    *,
-    since: str | None = None,
-    until: str | None = None,
-) -> Iterator[UsageRecord]:
-    """Yield one deduplicated UsageRecord per billed assistant message.
+def _iter_billed_messages(
+    projects_dir: Path,
+) -> Iterator[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
+    """Yield (entry, message, usage) for each deduplicated billed message.
+
+    Traversal is **recursive**. Subagent transcripts live one level deeper, at
+    ``<project-dir>/<parent-session-uuid>/subagents/agent-*.jsonl``, and they are
+    the majority of files in a real corpus. A one-level glob silently drops every
+    one of them along with all their spend.
 
     Deduplication is mandatory, not defensive: resumed and forked sessions
-    re-serialize earlier messages into new transcript files, and on a real corpus
-    roughly 60% of usage lines are repeats. Summing without deduplicating
-    overstates spend by about 2.5x.
+    re-serialize earlier messages into new transcript files, and roughly 60% of
+    usage lines are repeats. Summing without deduplicating overstates spend about
+    2.5x. Subagent messages carry their own ids and are never duplicates of the
+    parent's, so recursion adds real spend rather than double-counting.
+
+    This walk is shared by every scanner in the module so their coverage cannot
+    drift apart.
     """
     seen: set[str] = set()
-    for path in sorted(projects_dir.glob("*/*.jsonl")):
+    for path in sorted(projects_dir.rglob("*.jsonl")):
         try:
             handle = path.open(encoding="utf-8", errors="replace")
         except OSError:
@@ -253,51 +275,59 @@ def iter_usage_records(
                 usage = message.get("usage")
                 if not isinstance(usage, dict):
                     continue
-
                 message_id = message.get("id")
                 if not message_id or message_id in seen:
                     continue
                 seen.add(message_id)
+                yield entry, message, usage
 
-                timestamp = entry.get("timestamp") or ""
-                day = timestamp[:10]
-                if not day:
-                    continue
-                if since and day < since:
-                    continue
-                if until and day > until:
-                    continue
 
-                model = message.get("model")
-                cost = compute_cost(model, usage)
-                if cost is None:
-                    # Unpriced models are reported by summarise_unpriced(), never
-                    # folded into a total as zero.
-                    continue
+def iter_usage_records(
+    projects_dir: Path = CLAUDE_PROJECTS_DIR,
+    *,
+    since: str | None = None,
+    until: str | None = None,
+) -> Iterator[UsageRecord]:
+    """Yield one deduplicated UsageRecord per billed assistant message."""
+    for entry, message, usage in _iter_billed_messages(projects_dir):
+        day = (entry.get("timestamp") or "")[:10]
+        if not day:
+            continue
+        if since and day < since:
+            continue
+        if until and day > until:
+            continue
 
-                project = project_from_cwd(entry.get("cwd"))
-                if project is None:
-                    continue
+        model = message.get("model")
+        cost = compute_cost(model, usage)
+        if cost is None:
+            # Unpriced models are reported by summarise_unpriced(), never folded
+            # into a total as zero.
+            continue
 
-                cache_creation = usage.get("cache_creation") or {}
-                write = cache_creation.get("ephemeral_1h_input_tokens", 0) + cache_creation.get(
-                    "ephemeral_5m_input_tokens", 0
-                )
-                if not write:
-                    write = usage.get("cache_creation_input_tokens", 0)
+        project = project_from_cwd(entry.get("cwd"))
+        if project is None:
+            continue
 
-                yield UsageRecord(
-                    day=day,
-                    project=project,
-                    model=model or "unknown",
-                    cost_usd=cost,
-                    input_tokens=usage.get("input_tokens", 0),
-                    output_tokens=usage.get("output_tokens", 0),
-                    cache_read_tokens=usage.get("cache_read_input_tokens", 0),
-                    cache_write_tokens=write,
-                    is_subagent=bool(entry.get("isSidechain")),
-                    session_id=str(entry.get("sessionId") or ""),
-                )
+        cache_creation = usage.get("cache_creation") or {}
+        write = cache_creation.get("ephemeral_1h_input_tokens", 0) + cache_creation.get(
+            "ephemeral_5m_input_tokens", 0
+        )
+        if not write:
+            write = usage.get("cache_creation_input_tokens", 0)
+
+        yield UsageRecord(
+            day=day,
+            project=project,
+            model=model or "unknown",
+            cost_usd=cost,
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            cache_read_tokens=usage.get("cache_read_input_tokens", 0),
+            cache_write_tokens=write,
+            is_subagent=bool(entry.get("isSidechain")),
+            session_id=str(entry.get("sessionId") or ""),
+        )
 
 
 def summarise_unpriced(projects_dir: Path = CLAUDE_PROJECTS_DIR) -> dict[str, int]:
@@ -308,32 +338,10 @@ def summarise_unpriced(projects_dir: Path = CLAUDE_PROJECTS_DIR) -> dict[str, in
     so a model launch shows up as a named gap the same day it starts being used.
     """
     counts: dict[str, int] = defaultdict(int)
-    seen: set[str] = set()
-    for path in sorted(projects_dir.glob("*/*.jsonl")):
-        try:
-            handle = path.open(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        with handle:
-            for line in handle:
-                if '"usage"' not in line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(entry, dict) or entry.get("type") != "assistant":
-                    continue
-                message = entry.get("message")
-                if not isinstance(message, dict) or not isinstance(message.get("usage"), dict):
-                    continue
-                message_id = message.get("id")
-                if not message_id or message_id in seen:
-                    continue
-                seen.add(message_id)
-                model = message.get("model")
-                if model != SYNTHETIC_MODEL and resolve_rate(model) is None:
-                    counts[model or "(missing)"] += 1
+    for _entry, message, _usage in _iter_billed_messages(projects_dir):
+        model = message.get("model")
+        if model != SYNTHETIC_MODEL and resolve_rate(model) is None:
+            counts[model or "(missing)"] += 1
     return dict(counts)
 
 
