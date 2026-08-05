@@ -103,6 +103,31 @@ class TestResolveRate:
         for model, (inp, out) in BASE_RATES.items():
             assert inp > 0 and out > 0, model
 
+    def test_sonnet5_priced_by_record_day_not_table_edit_day(self):
+        """Intro pricing runs through 2026-08-31 inclusive; list price after.
+
+        The record's own day decides which side of the cutover it bills on, so
+        August usage recomputed in September still prices at the intro rate.
+        """
+        assert resolve_rate("claude-sonnet-5", "2026-08-31") == (2.0, 10.0)
+        assert resolve_rate("claude-sonnet-5", "2026-09-01") == (3.0, 15.0)
+
+    def test_sonnet5_dated_id_crosses_cutover(self):
+        assert resolve_rate("claude-sonnet-5-20260601", "2026-07-15") == (2.0, 10.0)
+        assert resolve_rate("claude-sonnet-5-20260601", "2026-12-01") == (3.0, 15.0)
+
+    def test_intro_pricing_none_day_means_today_utc(self, monkeypatch):
+        import cost_tracker.transcripts as transcripts_module
+
+        monkeypatch.setattr(transcripts_module, "_today_utc", lambda: "2026-08-15")
+        assert resolve_rate("claude-sonnet-5") == (2.0, 10.0)
+        monkeypatch.setattr(transcripts_module, "_today_utc", lambda: "2026-09-15")
+        assert resolve_rate("claude-sonnet-5") == (3.0, 15.0)
+
+    def test_day_does_not_affect_non_promo_models(self):
+        assert resolve_rate("claude-opus-5", "2026-01-01") == (5.0, 25.0)
+        assert resolve_rate("claude-opus-5", "2027-01-01") == (5.0, 25.0)
+
     def test_documented_cache_multipliers_are_not_silently_changed(self):
         """Pin Anthropic's published cache multipliers.
 
@@ -120,6 +145,12 @@ class TestComputeCost:
     def test_output_tokens_bill_at_output_rate(self):
         cost = compute_cost("claude-opus-5", _usage(output_tokens=1_000_000))
         assert cost == pytest.approx(25.0)
+
+    def test_record_day_threads_through_to_the_rate(self):
+        """A sonnet-5 message costs 50% more once intro pricing lapses."""
+        usage = _usage(input_tokens=1_000_000)
+        assert compute_cost("claude-sonnet-5", usage, "2026-08-15") == pytest.approx(2.0)
+        assert compute_cost("claude-sonnet-5", usage, "2026-09-15") == pytest.approx(3.0)
 
     def test_cache_read_bills_at_one_tenth_input(self):
         cost = compute_cost("claude-opus-5", _usage(cache_read=1_000_000))

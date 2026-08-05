@@ -46,7 +46,7 @@ import json
 from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -68,18 +68,32 @@ CACHE_WRITE_1H_MULTIPLIER = 2.0
 CACHE_READ_MULTIPLIER = 0.1
 
 # USD per 1M tokens, (input, output). Matched to the reviewed table in the
-# operator's cost hook. NOTE: claude-sonnet-5 carries INTRODUCTORY pricing through
-# 2026-08-31; list price after that is (3.0, 15.0) — REVISIT 2026-09-01.
+# operator's cost hook. Values here are LIST prices; time-limited launch pricing
+# lives in INTRO_RATES so a record is priced by its own day, not by whichever
+# price happened to be current when the table was last edited.
 BASE_RATES: dict[str, tuple[float, float]] = {
     "claude-opus-5": (5.0, 25.0),
     "claude-opus-4-8": (5.0, 25.0),
     "claude-opus-4-7": (5.0, 25.0),
     "claude-opus-4-6": (5.0, 25.0),
-    "claude-sonnet-5": (2.0, 10.0),
+    "claude-sonnet-5": (3.0, 15.0),
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
     "claude-fable-5": (10.0, 50.0),
 }
+
+# {model prefix: (inclusive last day of the promo, (input, output))}. The
+# operator's cost hook carries a single static table, so it needs a manual flip
+# when a promo lapses; this module does not.
+INTRO_RATES: dict[str, tuple[str, tuple[float, float]]] = {
+    "claude-sonnet-5": ("2026-08-31", (2.0, 10.0)),
+}
+
+
+def _today_utc() -> str:
+    """Current UTC date as YYYY-MM-DD (billing days are UTC)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
 
 # Emitted by Claude Code for locally-generated messages that were never billed.
 SYNTHETIC_MODEL = "<synthetic>"
@@ -117,22 +131,30 @@ class UsageRecord:
     session_id: str
 
 
-def resolve_rate(model: str | None) -> tuple[float, float] | None:
+def resolve_rate(model: str | None, day: str | None = None) -> tuple[float, float] | None:
     """Return (input, output) USD/MTok for a model id, or None if unpriced.
 
     Matching is by prefix so dated ids (``claude-haiku-4-5-20251001``) resolve to
     their family. Returning None rather than a zero is deliberate: an unpriced
     model must surface as an explicit gap, never be silently costed at nothing.
+
+    ``day`` is the ISO date the usage was billed (None means today, UTC): a
+    family under launch pricing resolves to its intro rate through the promo's
+    last day and to list price after, so historical recomputation stays correct
+    on both sides of a cutover.
     """
     if not model:
         return None
     for prefix, rate in BASE_RATES.items():
         if model.startswith(prefix):
+            intro = INTRO_RATES.get(prefix)
+            if intro is not None and (day or _today_utc()) <= intro[0]:
+                return intro[1]
             return rate
     return None
 
 
-def compute_cost(model: str | None, usage: dict[str, Any]) -> float | None:
+def compute_cost(model: str | None, usage: dict[str, Any], day: str | None = None) -> float | None:
     """Cost one message's usage block, or None when the model is unpriced.
 
     The 1h/5m cache split matters far more than it looks: 1h writes bill at 2x
@@ -140,7 +162,7 @@ def compute_cost(model: str | None, usage: dict[str, Any]) -> float | None:
     by roughly 300:1. Costing everything at the 5m rate understates the total by
     an order of magnitude more than every other correction combined.
     """
-    rate = resolve_rate(model)
+    rate = resolve_rate(model, day)
     if rate is None:
         return None
     input_rate, output_rate = rate
@@ -310,7 +332,7 @@ def iter_usage_records(
             continue
 
         model = message.get("model")
-        cost = compute_cost(model, usage)
+        cost = compute_cost(model, usage, day)
         if cost is None:
             # Unpriced models are reported by summarise_unpriced(), never folded
             # into a total as zero.

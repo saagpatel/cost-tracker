@@ -102,12 +102,19 @@ def month_token_totals(
 
 
 def total_under(
-    totals_by_model: dict[str, TokenTotals], *, cache_write_1h_multiplier: float
+    totals_by_model: dict[str, TokenTotals],
+    *,
+    cache_write_1h_multiplier: float,
+    month: str | None = None,
 ) -> float:
-    """Cost a month's token totals under one candidate 1h multiplier."""
+    """Cost a month's token totals under one candidate 1h multiplier.
+
+    ``month`` ("YYYY-MM") prices the totals as of that month, which matters when
+    a model family crosses an intro-pricing cutover; None means current rates.
+    """
     total = 0.0
     for model, totals in totals_by_model.items():
-        rate = resolve_rate(model)
+        rate = resolve_rate(model, f"{month}-01" if month else None)
         if rate is None:
             continue
         input_rate, output_rate = rate
@@ -166,7 +173,9 @@ def calibrate(
         per_month = []
         est_sum = act_sum = 0.0
         for month in sorted(usable):
-            estimated = total_under(totals[month], cache_write_1h_multiplier=multiplier)
+            estimated = total_under(
+                totals[month], cache_write_1h_multiplier=multiplier, month=month
+            )
             actual = usable[month]
             est_sum += estimated
             act_sum += actual
