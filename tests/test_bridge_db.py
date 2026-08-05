@@ -3,11 +3,31 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 from pathlib import Path
 
 import pytest
 
 from cost_tracker import bridge_db
+
+
+def _months_back(n: int) -> str:
+    """YYYY-MM for n calendar months before today.
+
+    The fixture uses relative months because cost_top_projects windows from
+    date.today(): absolute months silently age out of the window and tests
+    start failing from the passage of time alone.
+    """
+    d = date.today()
+    year, month = d.year, d.month - n
+    while month <= 0:
+        year, month = year - 1, month + 12
+    return f"{year:04d}-{month:02d}"
+
+
+RECENT_MONTH = _months_back(1)  # always inside a 90-day window
+OLDER_MONTH = _months_back(2)  # also always inside a 90-day window
+ABSENT_MONTH = _months_back(0)  # current month: no fixture row exists
 
 COST_RECORDS_DDL = """
 CREATE TABLE cost_records (
@@ -31,10 +51,10 @@ def tmp_db(tmp_path: Path) -> Path:
     conn.executemany(
         "INSERT INTO cost_records (system, month, amount, notes) VALUES (?, ?, ?, ?)",
         [
-            ("cc", "2026-05", 120.0, "project:asc-radar May spend"),
-            ("cc", "2026-04", 300.0, "project:asc-radar April spend"),
-            ("codex", "2026-05", 45.0, None),
-            ("notion_os", "2026-05", 10.0, "project:notion-os tooling"),
+            ("cc", RECENT_MONTH, 120.0, "project:asc-radar recent spend"),
+            ("cc", OLDER_MONTH, 300.0, "project:asc-radar older spend"),
+            ("codex", RECENT_MONTH, 45.0, None),
+            ("notion_os", RECENT_MONTH, 10.0, "project:notion-os tooling"),
         ],
     )
     conn.commit()
@@ -75,7 +95,7 @@ class TestCostTopProjects:
     def test_fallback_aggregates_cc_across_months(self, tmp_db):
         result = bridge_db.cost_top_projects(window_days=90, db_path=tmp_db)
 
-        # cc has April (300) + May (120) = 420 total
+        # cc has the older month (300) + the recent month (120) = 420 total
         cc_row = next((r for r in result if r.get("system") == "cc"), None)
         assert cc_row is not None
         assert cc_row["total_usd"] == pytest.approx(420.0)
@@ -83,16 +103,16 @@ class TestCostTopProjects:
 
 class TestLatestCostRecord:
     def test_returns_existing_record(self, tmp_db):
-        result = bridge_db.latest_cost_record(system="cc", month="2026-05", db_path=tmp_db)
+        result = bridge_db.latest_cost_record(system="cc", month=RECENT_MONTH, db_path=tmp_db)
 
         assert result["exists"] is True
         assert result["amount_usd"] == pytest.approx(120.0)
         assert result["recorded_at"]
 
     def test_missing_record_returns_exists_false(self, tmp_db):
-        result = bridge_db.latest_cost_record(system="cc", month="2026-06", db_path=tmp_db)
+        result = bridge_db.latest_cost_record(system="cc", month=ABSENT_MONTH, db_path=tmp_db)
 
-        assert result == {"system": "cc", "month": "2026-06", "exists": False}
+        assert result == {"system": "cc", "month": ABSENT_MONTH, "exists": False}
 
     def test_missing_db_returns_error(self, tmp_path):
         result = bridge_db.latest_cost_record(db_path=tmp_path / "nonexistent.db")
@@ -105,7 +125,7 @@ class TestLatestCostRecord:
 
         monkeypatch.setattr(bridge_db, "_connect", fail_connect)
 
-        result = bridge_db.latest_cost_record(system="cc", month="2026-05", db_path=tmp_db)
+        result = bridge_db.latest_cost_record(system="cc", month=RECENT_MONTH, db_path=tmp_db)
 
         assert result["error"] == "bridge_db_error"
         assert result["detail"] == "cannot open database"
@@ -115,7 +135,7 @@ class TestInsertCostRecord:
     def test_insert_valid_record(self, tmp_db):
         # Use personal_ops which is allowed by the DB CHECK constraint
         result = bridge_db.insert_cost_record(
-            month="2026-06",
+            month=ABSENT_MONTH,
             amount=99.99,
             system="personal_ops",
             notes="test insert",
@@ -126,7 +146,7 @@ class TestInsertCostRecord:
 
     def test_round_trip_readable_after_insert(self, tmp_db):
         bridge_db.insert_cost_record(
-            month="2026-06",
+            month=ABSENT_MONTH,
             amount=55.0,
             system="notion_os",
             notes="project:roundtrip-test",
@@ -150,7 +170,7 @@ class TestInsertCostRecord:
 
     def test_invalid_system_rejected(self, tmp_db):
         result = bridge_db.insert_cost_record(
-            month="2026-05",
+            month=RECENT_MONTH,
             amount=10.0,
             system="unknown_system",
             db_path=tmp_db,
@@ -160,7 +180,7 @@ class TestInsertCostRecord:
 
     def test_negative_amount_rejected(self, tmp_db):
         result = bridge_db.insert_cost_record(
-            month="2026-05",
+            month=RECENT_MONTH,
             amount=-1.0,
             system="codex",
             db_path=tmp_db,
@@ -169,7 +189,7 @@ class TestInsertCostRecord:
 
     def test_missing_db_returns_error(self, tmp_path):
         result = bridge_db.insert_cost_record(
-            month="2026-05",
+            month=RECENT_MONTH,
             amount=10.0,
             system="cc",
             db_path=tmp_path / "nonexistent.db",
@@ -177,17 +197,17 @@ class TestInsertCostRecord:
         assert result["error"] == "bridge_db_unavailable"
 
     def test_duplicate_system_month_upserts(self, tmp_db):
-        # "cc" + "2026-05" already exists at 120.0 in tmp_db fixture.
+        # "cc" + RECENT_MONTH already exists at 120.0 in tmp_db fixture.
         # A duplicate now upserts to match bridge-db's record_cost owner semantics
         # (ON CONFLICT(system, month) DO UPDATE), rather than raising IntegrityError.
         conn = sqlite3.connect(str(tmp_db))
         original_id = conn.execute(
-            "SELECT id FROM cost_records WHERE system='cc' AND month='2026-05'"
+            f"SELECT id FROM cost_records WHERE system='cc' AND month='{RECENT_MONTH}'"
         ).fetchone()[0]
         conn.close()
 
         result = bridge_db.insert_cost_record(
-            month="2026-05",
+            month=RECENT_MONTH,
             amount=200.0,
             system="cc",
             db_path=tmp_db,
@@ -199,10 +219,10 @@ class TestInsertCostRecord:
 
         conn = sqlite3.connect(str(tmp_db))
         amount = conn.execute(
-            "SELECT amount FROM cost_records WHERE system='cc' AND month='2026-05'"
+            f"SELECT amount FROM cost_records WHERE system='cc' AND month='{RECENT_MONTH}'"
         ).fetchone()[0]
         count = conn.execute(
-            "SELECT COUNT(*) FROM cost_records WHERE system='cc' AND month='2026-05'"
+            f"SELECT COUNT(*) FROM cost_records WHERE system='cc' AND month='{RECENT_MONTH}'"
         ).fetchone()[0]
         conn.close()
         assert amount == pytest.approx(200.0)
