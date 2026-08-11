@@ -205,7 +205,7 @@ class TestCostTopSessions:
                     {
                         **sample["session"]["sessions"][0],
                         "project": "Unknown Project",
-                        "projectPath": "/Users/d/Projects/cost-tracker",
+                        "projectPath": "~/Projects/cost-tracker",
                     }
                 ]
             }
@@ -213,7 +213,7 @@ class TestCostTopSessions:
         with patch("subprocess.run", return_value=_mock_run(payload)):
             result = ccusage.cost_top_sessions(window_days=14, limit=1)
 
-        assert result["sessions"][0]["project"] == "/Users/d/Projects/cost-tracker"
+        assert result["sessions"][0]["project"] == "~/Projects/cost-tracker"
 
     def test_falls_back_to_session_id_when_project_is_unknown(self, sample):
         payload = json.dumps(
