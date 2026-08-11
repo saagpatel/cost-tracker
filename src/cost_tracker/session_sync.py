@@ -255,7 +255,7 @@ def _recover_project_path(root: Path, encoded_project: str) -> str | None:
 def _fallback_recover_project_name(encoded_project: str) -> str | None:
     """Recover known lossy project names when the source tree is unavailable.
 
-    CI runs do not have the operator's full /Users/d/Projects tree, so
+    CI runs do not have the operator's full ~/Projects tree, so
     filesystem-based recovery cannot resolve dash-mangled Claude project
     directory names there. Keep this fallback intentionally conservative and
     tied to patterns the test suite documents.
