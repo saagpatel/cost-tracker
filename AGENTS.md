@@ -4,7 +4,7 @@
 
 ## Communication Contract
 
-- Inherit global Codex communication and reporting rules from `/Users/d/.codex/AGENTS.override.md` and `/Users/d/.codex/policies/communication/BigPictureReportingV1.md`.
+- Inherit global Codex communication and reporting rules from `~/.codex/AGENTS.override.md` and `~/.codex/policies/communication/BigPictureReportingV1.md`.
 - Repo-specific instructions below add project constraints only; do not restate global voice or status-reporting rules here.
 <!-- comm-contract:end -->
 
@@ -26,12 +26,12 @@ uv run ruff check .
 
 ## What This Project Is
 
-cost-tracker is an active local project in the /Users/d/Projects portfolio.
+cost-tracker is an active local project in the ~/Projects portfolio.
 
 ## Current State
 
 Current portfolio truth should be checked in
-`/Users/d/Projects/GithubRepoAuditor/output/portfolio-truth-latest.json`; recent
+`~/Projects/GithubRepoAuditor/output/portfolio-truth-latest.json`; recent
 runs mark this project as `active-infra`. The repo still has minimum-viable
 recovered context, so verify live branch, README, and package commands before
 expanding scope.

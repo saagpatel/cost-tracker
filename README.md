@@ -8,7 +8,7 @@ the `cost-tracker` entrypoint.
 ## Current State
 
 Current portfolio truth should be checked in
-`/Users/d/Projects/GithubRepoAuditor/output/portfolio-truth-latest.json`; recent
+`~/Projects/GithubRepoAuditor/output/portfolio-truth-latest.json`; recent
 runs mark this repo as `active-infra`. The repo still has minimum-viable
 context, so treat `AGENTS.md`, `pyproject.toml`, and the live source tree as the
 restart authority until a deeper roadmap or handoff exists.
@@ -45,7 +45,7 @@ Write-capable manual tool:
 - `cost_record` - inserts one cost row into bridge-db `cost_records`
 
 `cost-oracle` remains the report-only monthly automation under
-`/Users/d/.codex/automations/cost-oracle/automation.toml`. This MCP server is a
+`~/.codex/automations/cost-oracle/automation.toml`. This MCP server is a
 local visibility/helper surface, not the scheduled cost-report authority.
 
 ## Verify
