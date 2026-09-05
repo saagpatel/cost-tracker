@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -60,14 +60,20 @@ CREATE INDEX idx_sc_started ON session_costs(started_at DESC);
 def tmp_db_cost_records_only(tmp_path: Path) -> Path:
     """Temp DB with only cost_records table (no session_costs)."""
     db_path = tmp_path / "bridge.db"
+    # The fallback windows by month against date.today(); derive months so the
+    # fixture never ages out of the 90-day window.
+    today = date.today()
+    this_month = today.strftime("%Y-%m")
+    last_month = today.replace(day=1) - timedelta(days=1)
+    last_month = last_month.strftime("%Y-%m")
     conn = sqlite3.connect(str(db_path))
     conn.executescript(COST_RECORDS_DDL)
     conn.executemany(
         "INSERT INTO cost_records (system, month, amount, notes) VALUES (?, ?, ?, ?)",
         [
-            ("cc", "2026-05", 120.0, "project:asc-radar May spend"),
-            ("cc", "2026-04", 300.0, "project:asc-radar April spend"),
-            ("codex", "2026-05", 45.0, None),
+            ("cc", this_month, 120.0, "project:asc-radar current month spend"),
+            ("cc", last_month, 300.0, "project:asc-radar prior month spend"),
+            ("codex", this_month, 45.0, None),
         ],
     )
     conn.commit()
