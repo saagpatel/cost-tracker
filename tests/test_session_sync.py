@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
@@ -652,7 +653,60 @@ class TestSyncMalformedIdentifiersAndCosts:
         conn.close()
         assert row[0] == ""
 
+    def test_huge_integer_total_cost_is_skipped(self, tmp_db_for_sync):
+        sessions = [
+            {"period": "sess-huge", "metadata": {}, "totalCost": 10**400, "modelBreakdowns": []},
+            {"period": "sess-good", "metadata": {}, "totalCost": 3.5, "modelBreakdowns": []},
+        ]
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: sessions)
+        assert result["synced"] == 1
+        assert result["skipped"] == 1
+        assert result["errors"] == []
+        conn = sqlite3.connect(str(tmp_db_for_sync))
+        rows = conn.execute("SELECT session_id, cost_usd FROM session_costs").fetchall()
+        conn.close()
+        assert rows == [("sess-good", 3.5)]
 
+    def test_stored_model_costs_stay_finite_for_overflow_and_cancel(self, tmp_db_for_sync):
+        overflow = {
+            "period": "sess-overflow",
+            "metadata": {},
+            "totalCost": 1.0,
+            "modelBreakdowns": [
+                {"modelName": "claude-opus-4-7", "cost": 1e308},
+                {"modelName": "claude-opus-4-8", "cost": 1e308},
+            ],
+        }
+        cancel = {
+            "period": "sess-cancel",
+            "metadata": {},
+            "totalCost": 0.0,
+            "modelBreakdowns": [
+                {"modelName": "claude-opus-4-7", "cost": 1e308},
+                {"modelName": "claude-opus-4-8", "cost": -1e308},
+            ],
+        }
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: [overflow, cancel])
+        assert result["synced"] == 2
+        assert result["errors"] == []
+        conn = sqlite3.connect(str(tmp_db_for_sync))
+        rows = {
+            row[0]: json.loads(row[1])
+            for row in conn.execute("SELECT session_id, model_breakdown FROM session_costs")
+        }
+        conn.close()
+        for values in rows.values():
+            for cost in values.values():
+                assert isinstance(cost, (int, float)) and not isinstance(cost, bool)
+                assert math.isfinite(cost)
+        assert rows["sess-overflow"]["claude-opus-4-7"] == pytest.approx(1e308)
+        assert rows["sess-overflow"]["claude-opus-4-8"] == pytest.approx(1e308)
+        assert rows["sess-cancel"]["claude-opus-4-7"] == pytest.approx(1e308)
+        assert rows["sess-cancel"]["claude-opus-4-8"] == pytest.approx(-1e308)
+
+
+# ---------------------------------------------------------------------------
+# Tests: regression coverage for the 2026-07-26 cost-attribution defects
 #
 # Each class below pins one bug that made per-project attribution report a small
 # fraction of actual spend while the sync still returned zero errors. Every test

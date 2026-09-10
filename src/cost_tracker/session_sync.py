@@ -12,7 +12,13 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from cost_tracker.ccusage import _cost_usd, _iter_model_costs, _object_entries, _optional_str
+from cost_tracker.ccusage import (
+    _cost_usd,
+    _iter_model_costs,
+    _object_entries,
+    _optional_str,
+    _rounded_finite,
+)
 
 BRIDGE_DB_PATH = Path.home() / ".local" / "share" / "bridge-db" / "bridge.db"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -486,7 +492,10 @@ def sync_session_costs(
 
             model_breakdown: dict[str, float] = {}
             for name, cost in _iter_model_costs(session.get("modelBreakdowns")):
-                model_breakdown[name or "unknown"] = round(cost, 6)
+                stored = _rounded_finite(cost)
+                if stored is None:
+                    continue
+                model_breakdown[name or "unknown"] = stored
 
             try:
                 conn.execute(
