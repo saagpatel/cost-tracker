@@ -46,7 +46,7 @@ import json
 from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -92,7 +92,7 @@ INTRO_RATES: dict[str, tuple[str, tuple[float, float]]] = {
 
 def _today_utc() -> str:
     """Current UTC date as YYYY-MM-DD (billing days are UTC)."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return datetime.now(UTC).strftime("%Y-%m-%d")
 
 
 # Emitted by Claude Code for locally-generated messages that were never billed.
