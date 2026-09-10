@@ -84,14 +84,99 @@ def _positive_limit(limit: int) -> int:
     return max(limit, 0)
 
 
-def _entry_summary(entry: dict[str, Any], period_key: str) -> dict[str, Any]:
+def _load_object(stdout: str | None) -> tuple[dict[str, Any] | None, str | None]:
+    """Parse ccusage JSON that must be a top-level object.
+
+    Wrong envelopes (arrays, null, scalars) become an unavailable detail rather
+    than an AttributeError on ``.get`` or invented usage rows.
+    """
+    if stdout is None:
+        return None, "JSON parse error: empty output"
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        return None, f"JSON parse error: {exc}"
+    if not isinstance(data, dict):
+        kind = "null" if data is None else type(data).__name__
+        return None, f"unexpected JSON shape: {kind}"
+    return data, None
+
+
+def _object_entries(value: object) -> list[dict[str, Any]]:
+    """Return dict entries from a list-shaped ccusage field; else empty."""
+    if not isinstance(value, list):
+        return []
+    return [entry for entry in value if isinstance(entry, dict)]
+
+
+def _cost_usd(entry: dict[str, Any]) -> float | None:
+    """Return a numeric ``totalCost``, or None when the field is unusable.
+
+    A missing key keeps the stable empty 0.0. Wrong types are not coerced into
+    a fake spend figure.
+    """
+    if "totalCost" not in entry:
+        return 0.0
+    value = entry["totalCost"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _token_count(entry: dict[str, Any]) -> int | float:
+    if "totalTokens" not in entry:
+        return 0
+    value = entry["totalTokens"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return value
+
+
+def _models_used(entry: dict[str, Any]) -> list[Any]:
+    value = entry.get("modelsUsed", [])
+    if not isinstance(value, list):
+        return []
+    return value
+
+
+def _usable_entries(value: object) -> list[dict[str, Any]]:
+    """Dict entries whose ``totalCost`` is missing or numeric."""
+    entries: list[dict[str, Any]] = []
+    for entry in _object_entries(value):
+        if _cost_usd(entry) is None:
+            continue
+        entries.append(entry)
+    return entries
+
+
+def _rounded_cost(entry: dict[str, Any]) -> float:
+    cost = _cost_usd(entry)
+    return round(0.0 if cost is None else cost, 6)
+
+
+def _entry_summary(entry: dict[str, Any], period_key: str) -> dict[str, Any] | None:
+    period = entry.get(period_key)
+    if not isinstance(period, str):
+        return None
+    cost = _cost_usd(entry)
+    if cost is None:
+        return None
     return {
-        period_key: entry[period_key],
-        "total_usd": round(entry.get("totalCost", 0.0), 6),
-        "total_tokens": entry.get("totalTokens", 0),
+        period_key: period,
+        "total_usd": round(cost, 6),
+        "total_tokens": _token_count(entry),
         "by_model": _extract_by_model(entry.get("modelBreakdowns", [])),
-        "models_used": entry.get("modelsUsed", []),
+        "models_used": _models_used(entry),
     }
+
+
+def _summarize_entries(value: object, period_key: str) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for entry in _object_entries(value):
+        summary = _entry_summary(entry, period_key)
+        if summary is not None:
+            summaries.append(summary)
+    return summaries
 
 
 def _useful_label(value: Any) -> str | None:
@@ -128,16 +213,16 @@ def cost_today() -> dict[str, Any]:
     if err is not None:
         return {"error": _UNAVAILABLE_ERROR, "detail": err}
 
-    try:
-        data: dict[str, Any] = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        return {"error": _UNAVAILABLE_ERROR, "detail": f"JSON parse error: {exc}"}
+    data, err = _load_object(stdout)
+    if err is not None:
+        return {"error": _UNAVAILABLE_ERROR, "detail": err}
 
-    daily_list: list[dict[str, Any]] = data.get("daily", [])
     today_str = date.today().isoformat()
 
     # ccusage may return one or more days; find today's entry
-    entry = next((d for d in daily_list if d.get("date") == today_str), None)
+    entry = next(
+        (d for d in _usable_entries(data.get("daily", [])) if d.get("date") == today_str), None
+    )
     if entry is None:
         # No activity today yet
         return {
@@ -148,10 +233,10 @@ def cost_today() -> dict[str, Any]:
         }
 
     return {
-        "date": entry["date"],
-        "total_usd": round(entry.get("totalCost", 0.0), 6),
+        "date": today_str,
+        "total_usd": _rounded_cost(entry),
         "by_model": _extract_by_model(entry.get("modelBreakdowns", [])),
-        "session_count": len(entry.get("modelsUsed", [])),
+        "session_count": len(_models_used(entry)),
     }
 
 
@@ -171,12 +256,11 @@ def cost_session() -> dict[str, Any]:
     if err is not None:
         return {"error": _UNAVAILABLE_ERROR, "detail": err}
 
-    try:
-        data: dict[str, Any] = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        return {"error": _UNAVAILABLE_ERROR, "detail": f"JSON parse error: {exc}"}
+    data, err = _load_object(stdout)
+    if err is not None:
+        return {"error": _UNAVAILABLE_ERROR, "detail": err}
 
-    sessions: list[dict[str, Any]] = data.get("sessions", [])
+    sessions = _usable_entries(data.get("sessions", []))
     if not sessions:
         return {
             "session_id": None,
@@ -185,12 +269,12 @@ def cost_session() -> dict[str, Any]:
             "by_model": {},
         }
 
-    # Most-recently-active session (last in list after --since filter)
+    # Most-recently-active usable session (last in list after --since filter)
     current = sessions[-1]
     return {
         "session_id": current.get("sessionId"),
         "started_at": current.get("lastActivity", date.today().isoformat()),
-        "current_usd": round(current.get("totalCost", 0.0), 6),
+        "current_usd": _rounded_cost(current),
         "by_model": _extract_by_model(current.get("modelBreakdowns", [])),
     }
 
@@ -212,20 +296,22 @@ def cost_monthly_trend(months: int = 3) -> list[dict[str, Any]]:
     if err is not None:
         return [{"error": _UNAVAILABLE_ERROR, "detail": err}]
 
-    try:
-        data: dict[str, Any] = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        return [{"error": _UNAVAILABLE_ERROR, "detail": f"JSON parse error: {exc}"}]
+    data, err = _load_object(stdout)
+    if err is not None:
+        return [{"error": _UNAVAILABLE_ERROR, "detail": err}]
 
-    monthly_list: list[dict[str, Any]] = data.get("monthly", [])
-    result = [
-        {
-            "month": entry["month"],
-            "total_usd": round(entry.get("totalCost", 0.0), 6),
-            "by_model": _extract_by_model(entry.get("modelBreakdowns", [])),
-        }
-        for entry in monthly_list
-    ]
+    result: list[dict[str, Any]] = []
+    for entry in _usable_entries(data.get("monthly", [])):
+        month = entry.get("month")
+        if not isinstance(month, str):
+            continue
+        result.append(
+            {
+                "month": month,
+                "total_usd": _rounded_cost(entry),
+                "by_model": _extract_by_model(entry.get("modelBreakdowns", [])),
+            }
+        )
     # Sort oldest first (ccusage default is asc already, but be explicit)
     result.sort(key=lambda x: x["month"])
     return result
@@ -243,12 +329,14 @@ def cost_month_to_date() -> dict[str, Any]:
     if err is not None:
         return {"error": _UNAVAILABLE_ERROR, "detail": err}
 
-    try:
-        data: dict[str, Any] = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        return {"error": _UNAVAILABLE_ERROR, "detail": f"JSON parse error: {exc}"}
+    data, err = _load_object(stdout)
+    if err is not None:
+        return {"error": _UNAVAILABLE_ERROR, "detail": err}
 
-    entry = next((m for m in data.get("monthly", []) if m.get("month") == month), None)
+    entry = next(
+        (m for m in _usable_entries(data.get("monthly", [])) if m.get("month") == month),
+        None,
+    )
     if entry is None:
         return {
             "month": month,
@@ -258,7 +346,16 @@ def cost_month_to_date() -> dict[str, Any]:
             "models_used": [],
         }
 
-    return _entry_summary(entry, "month")
+    summary = _entry_summary(entry, "month")
+    if summary is None:
+        return {
+            "month": month,
+            "total_usd": 0.0,
+            "total_tokens": 0,
+            "by_model": {},
+            "models_used": [],
+        }
+    return summary
 
 
 def cost_top_days(days: int = 14, limit: int = 10) -> list[dict[str, Any]]:
@@ -271,12 +368,11 @@ def cost_top_days(days: int = 14, limit: int = 10) -> list[dict[str, Any]]:
     if err is not None:
         return [{"error": _UNAVAILABLE_ERROR, "detail": err}]
 
-    try:
-        data: dict[str, Any] = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        return [{"error": _UNAVAILABLE_ERROR, "detail": f"JSON parse error: {exc}"}]
+    data, err = _load_object(stdout)
+    if err is not None:
+        return [{"error": _UNAVAILABLE_ERROR, "detail": err}]
 
-    days_out = [_entry_summary(entry, "date") for entry in data.get("daily", [])]
+    days_out = _summarize_entries(data.get("daily", []), "date")
     return sorted(days_out, key=lambda x: x["total_usd"], reverse=True)[: _positive_limit(limit)]
 
 
@@ -292,23 +388,23 @@ def cost_top_sessions(window_days: int = 14, limit: int = 10) -> dict[str, Any]:
     if err is not None:
         return {"error": _UNAVAILABLE_ERROR, "detail": err}
 
-    try:
-        data: dict[str, Any] = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        return {"error": _UNAVAILABLE_ERROR, "detail": f"JSON parse error: {exc}"}
+    data, err = _load_object(stdout)
+    if err is not None:
+        return {"error": _UNAVAILABLE_ERROR, "detail": err}
 
-    sessions = [
-        {
-            "session_id": entry.get("sessionId"),
-            "project": _session_project(entry),
-            "last_activity": entry.get("lastActivity"),
-            "total_usd": round(entry.get("totalCost", 0.0), 6),
-            "total_tokens": entry.get("totalTokens", 0),
-            "by_model": _extract_by_model(entry.get("modelBreakdowns", [])),
-            "models_used": entry.get("modelsUsed", []),
-        }
-        for entry in data.get("sessions", [])
-    ]
+    sessions = []
+    for entry in _usable_entries(data.get("sessions", [])):
+        sessions.append(
+            {
+                "session_id": entry.get("sessionId"),
+                "project": _session_project(entry),
+                "last_activity": entry.get("lastActivity"),
+                "total_usd": _rounded_cost(entry),
+                "total_tokens": _token_count(entry),
+                "by_model": _extract_by_model(entry.get("modelBreakdowns", [])),
+                "models_used": _models_used(entry),
+            }
+        )
     return {
         "window_days": window_days,
         "attribution": "workflow_signal_not_invoice_window",

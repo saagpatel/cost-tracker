@@ -6,6 +6,7 @@ import json
 import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -13,6 +14,7 @@ from cost_tracker import bridge_db
 from cost_tracker.session_sync import (
     _build_session_project_map,
     _decode_project_name,
+    _run_ccusage,
     sync_session_costs,
 )
 
@@ -423,6 +425,114 @@ class TestSyncMalformedBreakdowns:
         breakdown = json.loads(row[0])
         assert breakdown["claude-sonnet-4-6"] == pytest.approx(1.0)
         assert "garbage" not in breakdown
+
+
+class TestRunCcusageJsonShapes:
+    """_run_ccusage is the session-sync JSON entrypoint and must not raise."""
+
+    MALFORMED = Path(__file__).parent / "fixtures" / "ccusage_malformed.json"
+
+    @pytest.fixture()
+    def malformed(self) -> dict:
+        return json.loads(self.MALFORMED.read_text())
+
+    def _mock_run(self, stdout: str, returncode: int = 0):
+        m = MagicMock()
+        m.returncode = returncode
+        m.stdout = stdout
+        m.stderr = "fatal" if returncode else ""
+        return m
+
+    def _parse(self, payload: object) -> list | None:
+        stdout = payload if isinstance(payload, str) else json.dumps(payload)
+        with patch("subprocess.run", return_value=self._mock_run(stdout)):
+            return _run_ccusage()
+
+    @pytest.mark.parametrize(
+        "payload_key",
+        [
+            "top_level_array",
+            "top_level_array_of_objects",
+            "top_level_null",
+            "top_level_number",
+            "top_level_string",
+            "sessions_field_object",
+            "sessions_field_null",
+            "sessions_empty",
+        ],
+    )
+    def test_wrong_or_empty_shapes_return_empty_list(self, malformed, payload_key):
+        assert self._parse(malformed[payload_key]) == []
+
+    def test_mixed_sessions_keep_only_dicts(self, malformed):
+        result = self._parse(malformed["sessions_mixed"])
+        assert [row["sessionId"] for row in result] == [
+            "-Users-d",
+            "-Users-d-Projects-cost-tracker",
+            "bad-cost",
+        ]
+
+    def test_legacy_wrapper_skips_non_dict_inner_entries(self, malformed):
+        result = self._parse(malformed["legacy_session_wrapper_mixed"])
+        assert result == [
+            {
+                "sessionId": "-Users-d",
+                "totalCost": 6.0,
+                "projectPath": "~",
+            }
+        ]
+
+    def test_missing_cli_returns_unavailable_none(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            assert _run_ccusage() is None
+
+    def test_bad_json_returns_unavailable_none(self):
+        with patch("subprocess.run", return_value=self._mock_run("not-json")):
+            assert _run_ccusage() is None
+
+    def test_nonzero_exit_returns_unavailable_none(self):
+        with patch("subprocess.run", return_value=self._mock_run("", returncode=1)):
+            assert _run_ccusage() is None
+
+
+class TestSyncHeterogeneousEntries:
+    def test_skips_non_dict_entries_and_syncs_valid(self, tmp_db_for_sync):
+        valid = {
+            "period": "sess-ok",
+            "metadata": {"lastActivity": "2026-05-18"},
+            "totalCost": 1.5,
+            "modelBreakdowns": [],
+        }
+        mixed = [None, "garbage", valid, 42, ["nope"]]
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: mixed)
+
+        assert result["synced"] == 1
+        assert result["skipped"] == 4
+        assert result["errors"] == []
+        conn = sqlite3.connect(str(tmp_db_for_sync))
+        row = conn.execute(
+            "SELECT cost_usd FROM session_costs WHERE session_id = 'sess-ok'"
+        ).fetchone()
+        conn.close()
+        assert row[0] == pytest.approx(1.5)
+
+    def test_wrong_typed_metadata_does_not_abort_sync(self, tmp_db_for_sync):
+        session = {
+            "period": "sess-meta",
+            "metadata": ["not-a-dict"],
+            "lastActivity": "2026-05-18",
+            "totalCost": 2.0,
+            "modelBreakdowns": None,
+        }
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: [session])
+        assert result["synced"] == 1
+        assert result["errors"] == []
+        conn = sqlite3.connect(str(tmp_db_for_sync))
+        row = conn.execute(
+            "SELECT started_at FROM session_costs WHERE session_id = 'sess-meta'"
+        ).fetchone()
+        conn.close()
+        assert row[0] == "2026-05-18"
 
 
 # ---------------------------------------------------------------------------
