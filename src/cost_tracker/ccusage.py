@@ -50,13 +50,27 @@ def _optional_str(value: object) -> str | None:
 
 
 def _finite_number(value: object) -> float | None:
-    """Return a finite int/float cost. Bool, NaN, and Infinity are not numbers."""
+    """Return a finite int/float. Bool, NaN, Infinity, and overflow are rejected."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
     if not math.isfinite(number):
         return None
     return number
+
+
+def _rounded_finite(value: float) -> float | None:
+    """Round to 6 decimals only when the result stays a finite float."""
+    try:
+        rounded = round(value, 6)
+    except OverflowError:
+        return None
+    if not math.isfinite(rounded):
+        return None
+    return rounded
 
 
 def _iter_model_costs(breakdowns: object) -> list[tuple[str, float]]:
@@ -88,11 +102,18 @@ def _iter_model_costs(breakdowns: object) -> list[tuple[str, float]]:
 
 
 def _extract_by_model(breakdowns: object) -> dict[str, float]:
-    """Aggregate model breakdowns into {family: total_cost}."""
+    """Aggregate model breakdowns into {family: total_cost}.
+
+    Each running family total is stored only when the rounded sum is finite, so
+    overflow (two 1e308 costs) and inf-cancellation to NaN cannot leak out.
+    """
     totals: dict[str, float] = {}
     for name, cost in _iter_model_costs(breakdowns):
         family = _model_family(name)
-        totals[family] = round(totals.get(family, 0.0) + cost, 6)
+        combined = _rounded_finite(totals.get(family, 0.0) + cost)
+        if combined is None:
+            continue
+        totals[family] = combined
     return totals
 
 
@@ -151,7 +172,10 @@ def _token_count(entry: dict[str, Any]) -> int | float:
     value = entry["totalTokens"]
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 0
-    if not math.isfinite(value):
+    try:
+        if not math.isfinite(value):
+            return 0
+    except OverflowError:
         return 0
     return value
 
@@ -175,7 +199,8 @@ def _usable_entries(value: object) -> list[dict[str, Any]]:
 
 def _rounded_cost(entry: dict[str, Any]) -> float:
     cost = _cost_usd(entry)
-    return round(0.0 if cost is None else cost, 6)
+    rounded = _rounded_finite(0.0 if cost is None else cost)
+    return 0.0 if rounded is None else rounded
 
 
 def _entry_summary(entry: dict[str, Any], period_key: str) -> dict[str, Any] | None:
@@ -185,9 +210,12 @@ def _entry_summary(entry: dict[str, Any], period_key: str) -> dict[str, Any] | N
     cost = _cost_usd(entry)
     if cost is None:
         return None
+    rounded = _rounded_finite(cost)
+    if rounded is None:
+        return None
     return {
         period_key: period,
-        "total_usd": round(cost, 6),
+        "total_usd": rounded,
         "total_tokens": _token_count(entry),
         "by_model": _extract_by_model(entry.get("modelBreakdowns", [])),
         "models_used": _models_used(entry),

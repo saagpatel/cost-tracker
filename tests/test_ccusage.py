@@ -355,6 +355,34 @@ class TestIterModelCosts:
         assert result["opus"] == pytest.approx(2.0)
         assert len(result) == 1
 
+    def test_huge_integer_cost_is_rejected(self):
+        assert ccusage._finite_number(10**400) is None
+        assert ccusage._iter_model_costs([{"modelName": "m", "cost": 10**400}]) == []
+
+    def test_huge_integer_tokens_are_zero(self):
+        assert ccusage._token_count({"totalTokens": 10**400}) == 0
+
+    def test_extract_by_model_overflow_keeps_finite_total(self):
+        result = ccusage._extract_by_model(
+            [
+                {"modelName": "claude-opus-4-7", "cost": 1e308},
+                {"modelName": "claude-opus-4-8", "cost": 1e308},
+            ]
+        )
+        assert "opus" in result
+        _assert_finite_cost(result["opus"])
+        assert result["opus"] == pytest.approx(1e308)
+
+    def test_extract_by_model_opposite_magnitudes_cancel_to_zero(self):
+        result = ccusage._extract_by_model(
+            [
+                {"modelName": "claude-opus-4-7", "cost": 1e308},
+                {"modelName": "claude-opus-4-8", "cost": -1e308},
+            ]
+        )
+        assert result["opus"] == pytest.approx(0.0)
+        _assert_finite_cost(result["opus"])
+
 
 class TestMalformedCcusageJson:
     """Every ccusage JSON entrypoint rejects wrong envelopes without inventing spend."""
@@ -687,3 +715,121 @@ class TestPublicResultScalarTypes:
         assert today["total_usd"] == pytest.approx(2.5)
         assert "opus" not in today["by_model"]
         assert today["by_model"]["sonnet"] == pytest.approx(2.5)
+
+    def test_huge_integer_total_cost_does_not_raise_and_is_not_spend(self):
+        payload = {
+            "daily": [
+                {"date": "2026-05-18", "totalCost": 10**400, "totalTokens": 10},
+                {"date": "2026-05-17", "totalCost": 2.0, "totalTokens": 5},
+            ]
+        }
+        today = _invoke(ccusage.cost_today, payload)
+        assert today["total_usd"] == 0.0
+        assert today["by_model"] == {}
+
+        days = _invoke(lambda: ccusage.cost_top_days(days=14, limit=10), payload)
+        assert [row["date"] for row in days] == ["2026-05-17"]
+        assert days[0]["total_usd"] == pytest.approx(2.0)
+
+        session_payload = {
+            "sessions": [
+                {"sessionId": "huge", "lastActivity": "2026-05-18", "totalCost": 10**400},
+                {"sessionId": "-Users-d", "lastActivity": "2026-05-18", "totalCost": 6.0},
+            ]
+        }
+        current = _invoke(ccusage.cost_session, session_payload)
+        assert current["session_id"] == "-Users-d"
+        assert current["current_usd"] == pytest.approx(6.0)
+        top = _invoke(lambda: ccusage.cost_top_sessions(window_days=14, limit=10), session_payload)
+        assert [row["session_id"] for row in top["sessions"]] == ["-Users-d"]
+        _assert_finite_cost(top["sessions"][0]["total_usd"])
+
+        monthly_payload = {
+            "monthly": [
+                {"month": "2026-05", "totalCost": 10**400},
+                {"month": "2026-04", "totalCost": 8.0},
+            ]
+        }
+        trend = _invoke(lambda: ccusage.cost_monthly_trend(months=3), monthly_payload)
+        assert [row["month"] for row in trend] == ["2026-04"]
+        mtd = _invoke(ccusage.cost_month_to_date, monthly_payload)
+        assert mtd["total_usd"] == 0.0
+
+    def test_huge_integer_tokens_are_zero_on_public_rows(self):
+        days = _invoke(
+            lambda: ccusage.cost_top_days(days=14, limit=10),
+            {"daily": [{"date": "2026-05-18", "totalCost": 2.0, "totalTokens": 10**400}]},
+        )
+        assert days[0]["total_tokens"] == 0
+        top = _invoke(
+            lambda: ccusage.cost_top_sessions(window_days=14, limit=10),
+            {
+                "sessions": [
+                    {
+                        "sessionId": "-Users-d",
+                        "lastActivity": "2026-05-18",
+                        "totalCost": 2.0,
+                        "totalTokens": 10**400,
+                    }
+                ]
+            },
+        )
+        assert top["sessions"][0]["total_tokens"] == 0
+
+    def test_model_aggregate_overflow_is_finite_on_public_results(self):
+        today = _invoke(
+            ccusage.cost_today,
+            {
+                "daily": [
+                    {
+                        "date": "2026-05-18",
+                        "totalCost": 1.0,
+                        "modelBreakdowns": [
+                            {"modelName": "claude-opus-4-7", "cost": 1e308},
+                            {"modelName": "claude-opus-4-8", "cost": 1e308},
+                        ],
+                    }
+                ]
+            },
+        )
+        assert today["total_usd"] == pytest.approx(1.0)
+        _assert_finite_cost(today["by_model"]["opus"])
+        assert today["by_model"]["opus"] == pytest.approx(1e308)
+        assert math.isfinite(today["by_model"]["opus"])
+
+        top = _invoke(
+            lambda: ccusage.cost_top_sessions(window_days=14, limit=10),
+            {
+                "sessions": [
+                    {
+                        "sessionId": "-Users-d",
+                        "lastActivity": "2026-05-18",
+                        "totalCost": 1.0,
+                        "modelBreakdowns": [
+                            {"modelName": "claude-opus-4-7", "cost": 1e308},
+                            {"modelName": "claude-opus-4-8", "cost": 1e308},
+                        ],
+                    }
+                ]
+            },
+        )
+        _assert_finite_cost(top["sessions"][0]["by_model"]["opus"])
+
+    def test_model_aggregate_cancellation_stays_finite_zero(self):
+        today = _invoke(
+            ccusage.cost_today,
+            {
+                "daily": [
+                    {
+                        "date": "2026-05-18",
+                        "totalCost": 0.0,
+                        "modelBreakdowns": [
+                            {"modelName": "claude-opus-4-7", "cost": 1e308},
+                            {"modelName": "claude-opus-4-8", "cost": -1e308},
+                        ],
+                    }
+                ]
+            },
+        )
+        assert today["by_model"]["opus"] == pytest.approx(0.0)
+        _assert_finite_cost(today["by_model"]["opus"])
