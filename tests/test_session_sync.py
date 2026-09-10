@@ -444,7 +444,7 @@ class TestRunCcusageJsonShapes:
         return m
 
     def _parse(self, payload: object) -> list | None:
-        stdout = payload if isinstance(payload, str) else json.dumps(payload)
+        stdout = json.dumps(payload)
         with patch("subprocess.run", return_value=self._mock_run(stdout)):
             return _run_ccusage()
 

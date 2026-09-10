@@ -35,7 +35,7 @@ def malformed() -> dict:
 
 
 def _invoke(callback: Callable[[], Any], payload: object) -> Any:
-    stdout = payload if isinstance(payload, str) else json.dumps(payload)
+    stdout = json.dumps(payload)
     with ExitStack() as stack:
         stack.enter_context(patch("cost_tracker.ccusage.date", FixedDate))
         stack.enter_context(patch("subprocess.run", return_value=_mock_run(stdout)))
