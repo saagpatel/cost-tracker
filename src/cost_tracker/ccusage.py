@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, cast
 
 _UNAVAILABLE_ERROR = "ccusage_unavailable"
 
@@ -43,11 +44,28 @@ def _model_family(model_name: str) -> str:
     return "other"
 
 
+def _optional_str(value: object) -> str | None:
+    """Return ``value`` when it is a string; otherwise explicit unavailability."""
+    return value if isinstance(value, str) else None
+
+
+def _finite_number(value: object) -> float | None:
+    """Return a finite int/float cost. Bool, NaN, and Infinity are not numbers."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number
+
+
 def _iter_model_costs(breakdowns: object) -> list[tuple[str, float]]:
     """Parse a ccusage ``modelBreakdowns`` value into (model_name, cost) pairs.
 
     Tolerates a null/non-list value, non-dict entries, and non-numeric costs so a
     malformed ccusage payload degrades to partial data instead of raising.
+    Invalid costs (bool, null, NaN, Infinity, non-numeric) are skipped rather
+    than coerced into spend. A missing ``cost`` key keeps the empty 0.0.
     """
     pairs: list[tuple[str, float]] = []
     if not isinstance(breakdowns, list):
@@ -55,13 +73,16 @@ def _iter_model_costs(breakdowns: object) -> list[tuple[str, float]]:
     for entry in breakdowns:
         if not isinstance(entry, dict):
             continue
-        name = entry.get("modelName", "")
+        item = cast(dict[str, Any], entry)
+        name = item.get("modelName", "")
         if not isinstance(name, str):
             name = ""
-        try:
-            cost = float(entry.get("cost", 0.0))
-        except (TypeError, ValueError):
-            cost = 0.0
+        if "cost" not in item:
+            pairs.append((name, 0.0))
+            continue
+        cost = _finite_number(item["cost"])
+        if cost is None:
+            continue
         pairs.append((name, cost))
     return pairs
 
@@ -106,21 +127,22 @@ def _object_entries(value: object) -> list[dict[str, Any]]:
     """Return dict entries from a list-shaped ccusage field; else empty."""
     if not isinstance(value, list):
         return []
-    return [entry for entry in value if isinstance(entry, dict)]
+    entries: list[dict[str, Any]] = []
+    for entry in value:
+        if isinstance(entry, dict):
+            entries.append(cast(dict[str, Any], entry))
+    return entries
 
 
 def _cost_usd(entry: dict[str, Any]) -> float | None:
     """Return a numeric ``totalCost``, or None when the field is unusable.
 
-    A missing key keeps the stable empty 0.0. Wrong types are not coerced into
-    a fake spend figure.
+    A missing key keeps the stable empty 0.0. Wrong types, bools, NaN, and
+    Infinity are not coerced into a fake spend figure.
     """
     if "totalCost" not in entry:
         return 0.0
-    value = entry["totalCost"]
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value)
+    return _finite_number(entry["totalCost"])
 
 
 def _token_count(entry: dict[str, Any]) -> int | float:
@@ -128,6 +150,8 @@ def _token_count(entry: dict[str, Any]) -> int | float:
         return 0
     value = entry["totalTokens"]
     if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not math.isfinite(value):
         return 0
     return value
 
@@ -197,7 +221,7 @@ def _session_project(entry: dict[str, Any]) -> str | None:
     if project is not None:
         return project
 
-    return entry.get("sessionId")
+    return _optional_str(entry.get("sessionId"))
 
 
 def cost_today() -> dict[str, Any]:
@@ -214,8 +238,8 @@ def cost_today() -> dict[str, Any]:
         return {"error": _UNAVAILABLE_ERROR, "detail": err}
 
     data, err = _load_object(stdout)
-    if err is not None:
-        return {"error": _UNAVAILABLE_ERROR, "detail": err}
+    if not isinstance(data, dict):
+        return {"error": _UNAVAILABLE_ERROR, "detail": err or "unexpected JSON shape"}
 
     today_str = date.today().isoformat()
 
@@ -257,8 +281,8 @@ def cost_session() -> dict[str, Any]:
         return {"error": _UNAVAILABLE_ERROR, "detail": err}
 
     data, err = _load_object(stdout)
-    if err is not None:
-        return {"error": _UNAVAILABLE_ERROR, "detail": err}
+    if not isinstance(data, dict):
+        return {"error": _UNAVAILABLE_ERROR, "detail": err or "unexpected JSON shape"}
 
     sessions = _usable_entries(data.get("sessions", []))
     if not sessions:
@@ -271,9 +295,12 @@ def cost_session() -> dict[str, Any]:
 
     # Most-recently-active usable session (last in list after --since filter)
     current = sessions[-1]
+    started_at = _optional_str(current.get("lastActivity"))
+    if started_at is None and "lastActivity" not in current:
+        started_at = date.today().isoformat()
     return {
-        "session_id": current.get("sessionId"),
-        "started_at": current.get("lastActivity", date.today().isoformat()),
+        "session_id": _optional_str(current.get("sessionId")),
+        "started_at": started_at,
         "current_usd": _rounded_cost(current),
         "by_model": _extract_by_model(current.get("modelBreakdowns", [])),
     }
@@ -297,8 +324,8 @@ def cost_monthly_trend(months: int = 3) -> list[dict[str, Any]]:
         return [{"error": _UNAVAILABLE_ERROR, "detail": err}]
 
     data, err = _load_object(stdout)
-    if err is not None:
-        return [{"error": _UNAVAILABLE_ERROR, "detail": err}]
+    if not isinstance(data, dict):
+        return [{"error": _UNAVAILABLE_ERROR, "detail": err or "unexpected JSON shape"}]
 
     result: list[dict[str, Any]] = []
     for entry in _usable_entries(data.get("monthly", [])):
@@ -330,8 +357,8 @@ def cost_month_to_date() -> dict[str, Any]:
         return {"error": _UNAVAILABLE_ERROR, "detail": err}
 
     data, err = _load_object(stdout)
-    if err is not None:
-        return {"error": _UNAVAILABLE_ERROR, "detail": err}
+    if not isinstance(data, dict):
+        return {"error": _UNAVAILABLE_ERROR, "detail": err or "unexpected JSON shape"}
 
     entry = next(
         (m for m in _usable_entries(data.get("monthly", [])) if m.get("month") == month),
@@ -369,8 +396,8 @@ def cost_top_days(days: int = 14, limit: int = 10) -> list[dict[str, Any]]:
         return [{"error": _UNAVAILABLE_ERROR, "detail": err}]
 
     data, err = _load_object(stdout)
-    if err is not None:
-        return [{"error": _UNAVAILABLE_ERROR, "detail": err}]
+    if not isinstance(data, dict):
+        return [{"error": _UNAVAILABLE_ERROR, "detail": err or "unexpected JSON shape"}]
 
     days_out = _summarize_entries(data.get("daily", []), "date")
     return sorted(days_out, key=lambda x: x["total_usd"], reverse=True)[: _positive_limit(limit)]
@@ -389,16 +416,16 @@ def cost_top_sessions(window_days: int = 14, limit: int = 10) -> dict[str, Any]:
         return {"error": _UNAVAILABLE_ERROR, "detail": err}
 
     data, err = _load_object(stdout)
-    if err is not None:
-        return {"error": _UNAVAILABLE_ERROR, "detail": err}
+    if not isinstance(data, dict):
+        return {"error": _UNAVAILABLE_ERROR, "detail": err or "unexpected JSON shape"}
 
     sessions = []
     for entry in _usable_entries(data.get("sessions", [])):
         sessions.append(
             {
-                "session_id": entry.get("sessionId"),
+                "session_id": _optional_str(entry.get("sessionId")),
                 "project": _session_project(entry),
-                "last_activity": entry.get("lastActivity"),
+                "last_activity": _optional_str(entry.get("lastActivity")),
                 "total_usd": _rounded_cost(entry),
                 "total_tokens": _token_count(entry),
                 "by_model": _extract_by_model(entry.get("modelBreakdowns", [])),

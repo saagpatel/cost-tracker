@@ -12,7 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from cost_tracker.ccusage import _iter_model_costs, _object_entries
+from cost_tracker.ccusage import _cost_usd, _iter_model_costs, _object_entries, _optional_str
 
 BRIDGE_DB_PATH = Path.home() / ".local" / "share" / "bridge-db" / "bridge.db"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -174,7 +174,8 @@ def _project_for_entry(
     project_path = _entry_project_path(session)
     if project_path:
         return _decode_project_name(project_path.split("/", 1)[0])
-    if session.get("period"):
+    period = session.get("period")
+    if isinstance(period, str) and period:
         return session_to_project.get(session_id)
     return _decode_project_name(session_id)
 
@@ -341,6 +342,17 @@ def _build_session_project_map(projects_dir: Path = CLAUDE_PROJECTS_DIR) -> dict
     return mapping
 
 
+def _session_identifier(session: dict[str, Any]) -> str | None:
+    """Return period or sessionId when it is a non-empty string."""
+    period = session.get("period")
+    if isinstance(period, str) and period:
+        return period
+    session_id = session.get("sessionId")
+    if isinstance(session_id, str) and session_id:
+        return session_id
+    return None
+
+
 def _run_ccusage() -> list[dict[str, Any]] | None:
     """Run `ccusage session --json` and return parsed sessions list."""
     try:
@@ -399,7 +411,7 @@ def sync_session_costs(
 
     fetch = ccusage_fn if ccusage_fn is not None else _run_ccusage
     sessions = fetch()
-    if sessions is None:
+    if sessions is None or not isinstance(sessions, list):
         return {"synced": 0, "skipped": 0, "errors": ["ccusage failed or unavailable"]}
 
     if not db_path.exists():
@@ -447,8 +459,8 @@ def sync_session_costs(
             if not isinstance(session, dict):
                 skipped += 1
                 continue
-            raw_id = session.get("period") or session.get("sessionId")
-            if not raw_id:
+            raw_id = _session_identifier(session)
+            if raw_id is None:
                 skipped += 1
                 continue
 
@@ -462,9 +474,15 @@ def sync_session_costs(
             metadata = session.get("metadata", {})
             if not isinstance(metadata, dict):
                 metadata = {}
-            started_at = metadata.get("lastActivity") or session.get("lastActivity", "")
+            started_at = _optional_str(metadata.get("lastActivity"))
+            if not started_at:
+                fallback = session.get("lastActivity", "")
+                started_at = fallback if isinstance(fallback, str) else ""
 
-            cost_usd = session.get("totalCost", 0.0)
+            cost_usd = _cost_usd(session)
+            if cost_usd is None:
+                skipped += 1
+                continue
 
             model_breakdown: dict[str, float] = {}
             for name, cost in _iter_model_costs(session.get("modelBreakdowns")):

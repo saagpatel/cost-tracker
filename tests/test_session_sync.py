@@ -535,8 +535,124 @@ class TestSyncHeterogeneousEntries:
         assert row[0] == "2026-05-18"
 
 
-# ---------------------------------------------------------------------------
-# Tests: regression coverage for the 2026-07-26 cost-attribution defects
+class TestSyncMalformedIdentifiersAndCosts:
+    """sessionId/period must be strings; bool/NaN costs must not become spend."""
+
+    def test_list_period_falls_back_to_string_session_id(self, tmp_db_for_sync):
+        session = {
+            "period": ["sess-list"],
+            "sessionId": "sess-ok",
+            "metadata": {},
+            "totalCost": 1.25,
+            "modelBreakdowns": [],
+        }
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: [session])
+        assert result["synced"] == 1
+        assert result["skipped"] == 0
+        assert result["errors"] == []
+        conn = sqlite3.connect(str(tmp_db_for_sync))
+        row = conn.execute(
+            "SELECT session_id, cost_usd FROM session_costs WHERE session_id = 'sess-ok'"
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[1] == pytest.approx(1.25)
+
+    @pytest.mark.parametrize(
+        "session",
+        [
+            {"sessionId": ["sess"], "metadata": {}, "totalCost": 1.0},
+            {"period": {"id": "x"}, "metadata": {}, "totalCost": 1.0},
+            {"period": ["sess"], "sessionId": {"id": "x"}, "metadata": {}, "totalCost": 1.0},
+            {"period": None, "sessionId": None, "metadata": {}, "totalCost": 1.0},
+        ],
+    )
+    def test_non_string_identifiers_are_skipped(self, tmp_db_for_sync, session):
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: [session])
+        assert result["synced"] == 0
+        assert result["skipped"] == 1
+        assert result["errors"] == []
+        conn = sqlite3.connect(str(tmp_db_for_sync))
+        count = conn.execute("SELECT COUNT(*) FROM session_costs").fetchone()[0]
+        conn.close()
+        assert count == 0
+
+    def test_mixed_identifier_shapes_keep_only_string_ids(self, tmp_db_for_sync):
+        sessions = [
+            {"sessionId": ["bad"], "metadata": {}, "totalCost": 9.0},
+            {
+                "period": "sess-good",
+                "metadata": {"lastActivity": "2026-05-18"},
+                "totalCost": 2.0,
+                "modelBreakdowns": [],
+            },
+            {"period": {"id": "nope"}, "metadata": {}, "totalCost": 8.0},
+        ]
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: sessions)
+        assert result["synced"] == 1
+        assert result["skipped"] == 2
+        conn = sqlite3.connect(str(tmp_db_for_sync))
+        rows = conn.execute("SELECT session_id, cost_usd FROM session_costs").fetchall()
+        conn.close()
+        assert rows == [("sess-good", 2.0)]
+
+    @pytest.mark.parametrize(
+        "bad_cost", [True, False, None, float("nan"), float("inf"), float("-inf")]
+    )
+    def test_bool_null_and_nonfinite_total_cost_are_not_synced(self, tmp_db_for_sync, bad_cost):
+        sessions = [
+            {"period": "sess-bad", "metadata": {}, "totalCost": bad_cost, "modelBreakdowns": []},
+            {"period": "sess-good", "metadata": {}, "totalCost": 3.5, "modelBreakdowns": []},
+        ]
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: sessions)
+        assert result["synced"] == 1
+        assert result["skipped"] == 1
+        conn = sqlite3.connect(str(tmp_db_for_sync))
+        rows = conn.execute("SELECT session_id, cost_usd FROM session_costs").fetchall()
+        conn.close()
+        assert rows == [("sess-good", 3.5)]
+
+    def test_bool_model_cost_is_not_stored_as_one(self, tmp_db_for_sync):
+        session = {
+            "period": "sess-model",
+            "metadata": {},
+            "totalCost": 5.0,
+            "modelBreakdowns": [
+                {"modelName": "claude-opus-4-7", "cost": True},
+                {"modelName": "claude-sonnet-4-6", "cost": 5.0},
+            ],
+        }
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: [session])
+        assert result["synced"] == 1
+        conn = sqlite3.connect(str(tmp_db_for_sync))
+        row = conn.execute(
+            "SELECT cost_usd, model_breakdown FROM session_costs WHERE session_id = 'sess-model'"
+        ).fetchone()
+        conn.close()
+        assert row[0] == pytest.approx(5.0)
+        breakdown = json.loads(row[1])
+        assert "claude-opus-4-7" not in breakdown
+        assert breakdown["claude-sonnet-4-6"] == pytest.approx(5.0)
+
+    def test_list_timestamp_does_not_abort_and_uses_empty_started_at(self, tmp_db_for_sync):
+        session = {
+            "period": "sess-time",
+            "metadata": {"lastActivity": ["2026-05-18"]},
+            "lastActivity": {"when": "now"},
+            "totalCost": 1.0,
+            "modelBreakdowns": [],
+        }
+        result = sync_session_costs(db_path=tmp_db_for_sync, ccusage_fn=lambda: [session])
+        assert result["synced"] == 1
+        assert result["errors"] == []
+        conn = sqlite3.connect(str(tmp_db_for_sync))
+        row = conn.execute(
+            "SELECT started_at FROM session_costs WHERE session_id = 'sess-time'"
+        ).fetchone()
+        conn.close()
+        assert row[0] == ""
+
+
 #
 # Each class below pins one bug that made per-project attribution report a small
 # fraction of actual spend while the sync still returned zero errors. Every test
