@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable
 from contextlib import ExitStack
 from datetime import date
@@ -316,8 +317,30 @@ class TestIterModelCosts:
             ("m", 1.5)
         ]
 
-    def test_non_numeric_cost_becomes_zero(self):
-        assert ccusage._iter_model_costs([{"modelName": "m", "cost": "oops"}]) == [("m", 0.0)]
+    def test_non_numeric_cost_is_skipped(self):
+        assert ccusage._iter_model_costs([{"modelName": "m", "cost": "oops"}]) == []
+
+    def test_bool_cost_is_skipped(self):
+        assert ccusage._iter_model_costs([{"modelName": "m", "cost": True}]) == []
+        assert ccusage._iter_model_costs([{"modelName": "m", "cost": False}]) == []
+
+    def test_null_nan_and_inf_cost_are_skipped(self):
+        assert ccusage._iter_model_costs([{"modelName": "m", "cost": None}]) == []
+        assert ccusage._iter_model_costs([{"modelName": "m", "cost": float("nan")}]) == []
+        assert ccusage._iter_model_costs([{"modelName": "m", "cost": float("inf")}]) == []
+        assert ccusage._iter_model_costs([{"modelName": "m", "cost": float("-inf")}]) == []
+
+    def test_mixed_valid_and_bool_keeps_only_numeric(self):
+        result = ccusage._iter_model_costs(
+            [
+                {"modelName": "claude-opus-4-7", "cost": True},
+                {"modelName": "claude-sonnet-4-6", "cost": 2.5},
+            ]
+        )
+        assert result == [("claude-sonnet-4-6", 2.5)]
+
+    def test_missing_cost_stays_zero(self):
+        assert ccusage._iter_model_costs([{"modelName": "m"}]) == [("m", 0.0)]
 
     def test_missing_name_becomes_empty_string(self):
         assert ccusage._iter_model_costs([{"cost": 2.0}]) == [("", 2.0)]
@@ -525,3 +548,142 @@ class TestObjectEntries:
 
     def test_skips_non_dict_entries(self):
         assert ccusage._object_entries([None, "x", {"a": 1}, 3]) == [{"a": 1}]
+
+
+def _assert_optional_str(value: object) -> None:
+    assert value is None or isinstance(value, str)
+
+
+def _assert_finite_cost(value: object) -> None:
+    assert isinstance(value, (int, float)) and not isinstance(value, bool)
+    assert math.isfinite(value)
+
+
+class TestPublicResultScalarTypes:
+    """Identifiers, timestamps, and costs in public results are strings or unavailable."""
+
+    def test_cost_top_sessions_sanitizes_list_dict_bool_fields(self):
+        payload = {
+            "sessions": [
+                {
+                    "sessionId": ["not", "an", "id"],
+                    "project": ["proj"],
+                    "projectPath": {"p": 1},
+                    "lastActivity": {"when": "now"},
+                    "totalCost": 3.25,
+                    "totalTokens": 10,
+                    "modelsUsed": ["claude-sonnet-4-6"],
+                    "modelBreakdowns": [{"modelName": "claude-sonnet-4-6", "cost": 3.25}],
+                },
+                {
+                    "sessionId": "-Users-d-Projects-cost-tracker",
+                    "projectPath": "~/Projects/cost-tracker",
+                    "lastActivity": "2026-05-18",
+                    "totalCost": 1.5,
+                },
+            ]
+        }
+        result = _invoke(lambda: ccusage.cost_top_sessions(window_days=14, limit=10), payload)
+        assert result["attribution"] == "workflow_signal_not_invoice_window"
+        assert len(result["sessions"]) == 2
+        for row in result["sessions"]:
+            _assert_optional_str(row["session_id"])
+            _assert_optional_str(row["project"])
+            _assert_optional_str(row["last_activity"])
+            _assert_finite_cost(row["total_usd"])
+        malformed = result["sessions"][0]
+        assert malformed["session_id"] is None
+        assert malformed["project"] is None
+        assert malformed["last_activity"] is None
+        assert malformed["total_usd"] == pytest.approx(3.25)
+        valid = result["sessions"][1]
+        assert valid["session_id"] == "-Users-d-Projects-cost-tracker"
+        assert valid["project"] == "~/Projects/cost-tracker"
+        assert valid["last_activity"] == "2026-05-18"
+
+    def test_cost_session_sanitizes_identifier_and_timestamp(self):
+        payload = {
+            "sessions": [
+                {
+                    "sessionId": {"id": "nested"},
+                    "lastActivity": ["2026-05-18"],
+                    "totalCost": 4.0,
+                }
+            ]
+        }
+        result = _invoke(ccusage.cost_session, payload)
+        _assert_optional_str(result["session_id"])
+        assert result["session_id"] is None
+        _assert_optional_str(result["started_at"])
+        assert result["started_at"] is None
+        _assert_finite_cost(result["current_usd"])
+        assert result["current_usd"] == pytest.approx(4.0)
+
+    @pytest.mark.parametrize(
+        "bad_cost", [True, False, None, float("nan"), float("inf"), float("-inf")]
+    )
+    def test_bool_null_and_nonfinite_costs_are_not_spend(self, bad_cost):
+        payload = {
+            "sessions": [
+                {
+                    "sessionId": "bad-cost",
+                    "lastActivity": "2026-05-18",
+                    "totalCost": bad_cost,
+                },
+                {
+                    "sessionId": "-Users-d",
+                    "lastActivity": "2026-05-18",
+                    "totalCost": 6.0,
+                },
+            ]
+        }
+        current = _invoke(ccusage.cost_session, payload)
+        assert current["session_id"] == "-Users-d"
+        assert current["current_usd"] == pytest.approx(6.0)
+
+        top = _invoke(lambda: ccusage.cost_top_sessions(window_days=14, limit=10), payload)
+        assert [row["session_id"] for row in top["sessions"]] == ["-Users-d"]
+        for row in top["sessions"]:
+            _assert_finite_cost(row["total_usd"])
+            assert row["total_usd"] == pytest.approx(6.0)
+
+    def test_json_nan_infinity_and_bool_daily_costs_are_skipped(self):
+        today = _invoke(
+            ccusage.cost_today,
+            {"daily": [{"date": "2026-05-18", "totalCost": True}]},
+        )
+        assert today["total_usd"] == 0.0
+        assert today["session_count"] == 0
+
+        days = _invoke(
+            lambda: ccusage.cost_top_days(days=14, limit=10),
+            {
+                "daily": [
+                    {"date": "2026-05-18", "totalCost": float("nan")},
+                    {"date": "2026-05-17", "totalCost": float("inf")},
+                    {"date": "2026-05-16", "totalCost": 2.0},
+                ]
+            },
+        )
+        assert [row["date"] for row in days] == ["2026-05-16"]
+        assert days[0]["total_usd"] == pytest.approx(2.0)
+
+    def test_bool_model_cost_does_not_invent_by_model_spend(self):
+        today = _invoke(
+            ccusage.cost_today,
+            {
+                "daily": [
+                    {
+                        "date": "2026-05-18",
+                        "totalCost": 2.5,
+                        "modelBreakdowns": [
+                            {"modelName": "claude-opus-4-7", "cost": True},
+                            {"modelName": "claude-sonnet-4-6", "cost": 2.5},
+                        ],
+                    }
+                ]
+            },
+        )
+        assert today["total_usd"] == pytest.approx(2.5)
+        assert "opus" not in today["by_model"]
+        assert today["by_model"]["sonnet"] == pytest.approx(2.5)
