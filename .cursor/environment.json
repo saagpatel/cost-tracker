@@ -1,0 +1,5 @@
+{
+  "name": "cost-tracker",
+  "install": "bash .cursor/cloud-build.sh",
+  "disableAllMcpServers": true
+}
