@@ -12,7 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from cost_tracker.ccusage import _iter_model_costs
+from cost_tracker.ccusage import _iter_model_costs, _object_entries
 
 BRIDGE_DB_PATH = Path.home() / ".local" / "share" / "bridge-db" / "bridge.db"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -356,14 +356,14 @@ def _run_ccusage() -> list[dict[str, Any]] | None:
         raw = json.loads(result.stdout.strip())
         # ccusage session --json returns {"sessions": [...]}
         if isinstance(raw, dict):
-            return raw.get("sessions", [])
+            return _object_entries(raw.get("sessions"))
         # Older formats: [["session", [...]]] — handle defensively
         if isinstance(raw, list):
             for item in raw:
                 if isinstance(item, list) and len(item) == 2 and item[0] == "session":
                     inner = item[1]
                     if isinstance(inner, list):
-                        return inner
+                        return _object_entries(inner)
         return []
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
         return None
@@ -444,6 +444,9 @@ def sync_session_costs(
             }
 
         for session in sessions:
+            if not isinstance(session, dict):
+                skipped += 1
+                continue
             raw_id = session.get("period") or session.get("sessionId")
             if not raw_id:
                 skipped += 1
@@ -457,6 +460,8 @@ def sync_session_costs(
             project_name = _project_for_entry(session, raw_id, session_to_project)
 
             metadata = session.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
             started_at = metadata.get("lastActivity") or session.get("lastActivity", "")
 
             cost_usd = session.get("totalCost", 0.0)
