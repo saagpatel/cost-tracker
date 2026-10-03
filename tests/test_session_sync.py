@@ -88,6 +88,12 @@ def tmp_db_cost_records_only(tmp_path: Path) -> Path:
 def tmp_db_with_session_costs(tmp_path: Path) -> Path:
     """Temp DB with session_costs populated."""
     db_path = tmp_path / "bridge.db"
+    # Keep sessions inside the aggregation window whenever the suite runs.
+    today = date.today()
+
+    def recent_timestamp(days_ago: int) -> str:
+        return f"{today - timedelta(days=days_ago)}T10:00:00.000Z"
+
     conn = sqlite3.connect(str(db_path))
     conn.executescript(COST_RECORDS_DDL + SESSION_COSTS_DDL)
     conn.executemany(
@@ -95,10 +101,10 @@ def tmp_db_with_session_costs(tmp_path: Path) -> Path:
            (session_id, project_name, started_at, cost_usd, model_breakdown, source)
            VALUES (?, ?, ?, ?, '{}', 'cc')""",
         [
-            ("aaa-111", "Afterimage", "2026-06-15T10:00:00.000Z", 5.50),
-            ("aaa-222", "Afterimage", "2026-06-16T10:00:00.000Z", 3.25),
-            ("bbb-111", "cost-tracker", "2026-06-17T10:00:00.000Z", 1.00),
-            ("ccc-111", None, "2026-06-18T10:00:00.000Z", 0.75),  # unmapped
+            ("aaa-111", "Afterimage", recent_timestamp(4), 5.50),
+            ("aaa-222", "Afterimage", recent_timestamp(3), 3.25),
+            ("bbb-111", "cost-tracker", recent_timestamp(2), 1.00),
+            ("ccc-111", None, recent_timestamp(1), 0.75),  # unmapped
         ],
     )
     conn.commit()
